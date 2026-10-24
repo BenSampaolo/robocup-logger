@@ -583,6 +583,24 @@ impl App {
         })
     }
 
+    pub fn offer_detected_teams(&mut self, teams: Option<(u8, u8)>) {
+        let Mode::Form(form) = &mut self.mode else {
+            return;
+        };
+        if !matches!(form.kind, FormKind::Setup) {
+            return;
+        }
+        let teams = teams.and_then(|(first, second)| Some([team_name(first)?, team_name(second)?]));
+        if let Some(teams) = teams {
+            form.detected_teams = Some(DetectedTeams { teams, selected: 0 });
+            self.status = "Choose the tracked team to set both draft teams and use Official match type; Cancel keeps the draft".into();
+        } else {
+            self.status =
+                "No fresh supported GC teams detected; fill in the setup manually or try again"
+                    .into();
+        }
+    }
+
     pub fn poll_discovery(&mut self) {
         if self.controller.is_none() {
             self.discovery.poll();
@@ -1318,17 +1336,8 @@ impl App {
                     && command == Some(Command::Confirm)
                     && form.selected == form.fields.len() + 2
                 {
-                    let teams = self
-                        .discovery
-                        .detected_teams()
-                        .and_then(|(first, second)| Some([team_name(first)?, team_name(second)?]));
-                    if let Some(teams) = teams {
-                        form.detected_teams = Some(DetectedTeams { teams, selected: 0 });
-                        self.status = "Choose the tracked team to set both draft teams and use Official match type; Cancel keeps the draft".into();
-                    } else {
-                        self.status = "No fresh supported GC teams detected; fill in the setup manually or try again".into();
-                    }
                     self.mode = Mode::Form(form);
+                    self.offer_detected_teams(self.discovery.detected_teams());
                 } else if command == Some(Command::Confirm) && form.selected == form.fields.len() {
                     if let Err(error) = self.apply_form(&form) {
                         self.status = error;

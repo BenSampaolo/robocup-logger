@@ -2,6 +2,46 @@ use super::*;
 use crate::test_support::{key, saved, time};
 
 #[test]
+fn detected_gc_setup_requires_team_choice_and_keeps_defaults_without_creating_a_match() {
+    let settings = Settings {
+        event: "Tournament".into(),
+        ..Settings::default()
+    };
+    let mut app = App::new_with_settings(None, &settings).unwrap();
+    app.offer_detected_teams(Some((101, 102)));
+    let Mode::Form(form) = &app.mode else {
+        panic!("expected setup")
+    };
+    assert_eq!(form.detected_teams.as_ref().unwrap().selected, 0);
+    app.key(key(KeyCode::Enter), time()).unwrap();
+    let Mode::Form(form) = &app.mode else {
+        panic!("expected setup")
+    };
+    assert!(form.detected_teams.is_none());
+    assert_eq!(form.fields[1].value(), settings.home);
+    app.offer_detected_teams(None);
+    let Mode::Form(form) = &app.mode else {
+        panic!("expected setup")
+    };
+    assert!(form.detected_teams.is_none());
+    app.offer_detected_teams(Some((101, 102)));
+    for code in [KeyCode::Down, KeyCode::Down, KeyCode::Enter] {
+        app.key(key(code), time()).unwrap();
+    }
+    let Mode::Form(form) = &app.mode else {
+        panic!("expected setup")
+    };
+    assert_eq!(form.fields[1].value(), "foom bots");
+    assert_eq!(form.fields[2].value(), "FC Isar robotics");
+    assert_eq!(form.match_type, Some(MatchType::Official));
+    assert_eq!(form.fields[0].value(), settings.event);
+    for (field, robot) in form.fields[5..10].iter().zip(&settings.robots) {
+        assert_eq!(field.value(), robot);
+    }
+    assert!(app.session.is_none() && app.store.is_none() && app.controller.is_none());
+}
+
+#[test]
 fn live_notes_keep_their_timestamp_and_failed_saves_block_exit() {
     let (_dir, mut app) = saved(MatchType::Official);
     app.key(key(KeyCode::Enter), time()).unwrap();

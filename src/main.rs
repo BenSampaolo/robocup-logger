@@ -104,12 +104,17 @@ fn interactive(initial: Option<launcher::Launch>) -> io::Result<()> {
             };
             let workflow = (|| -> io::Result<()> {
                 match launch {
-                    launcher::Launch::New | launcher::Launch::Resume(_) => {
+                    launcher::Launch::New
+                    | launcher::Launch::NewFromController(_)
+                    | launcher::Launch::Resume(_) => {
                         let path = match &launch {
                             launcher::Launch::Resume(path) => Some(path.as_path()),
                             _ => None,
                         };
                         let mut app = app::App::new_with_settings(path, &settings)?;
+                        if let launcher::Launch::NewFromController(teams) = launch {
+                            app.offer_detected_teams(Some(teams));
+                        }
                         run(&mut terminal, &mut app)?;
                     }
                     launcher::Launch::Postgame(path) => {

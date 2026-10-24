@@ -25,6 +25,7 @@ use crate::{
 
 pub(crate) enum Launch {
     New,
+    NewFromController((u8, u8)),
     Resume(PathBuf),
     Postgame(Option<PathBuf>),
 }
@@ -48,6 +49,7 @@ pub(crate) fn run(
     loop {
         let mut items = [
             "New match",
+            "New match from GC",
             "Resume match",
             "Postgame meeting",
             "Manage sessions / recordings",
@@ -65,9 +67,9 @@ pub(crate) fn run(
             )
         }));
         items.push("Exit".into());
-        let choice = {
+        let (choice, detected_teams) = {
             let mut discovery = Discovery::default();
-            choose_with_discovery(
+            let choice = choose_with_discovery(
                 terminal,
                 "RoboCup logger / Home",
                 &items,
@@ -77,25 +79,36 @@ pub(crate) fn run(
                 None,
                 Some(&mut discovery),
                 false,
-            )?
+            )?;
+            (choice, discovery.detected_teams())
         };
         match choice {
             Some(0) => return Ok(Some(Launch::New)),
-            Some(1 | 2) => {
+            Some(1) => {
+                if let Some(teams) = detected_teams {
+                    return Ok(Some(Launch::NewFromController(teams)));
+                }
+                show_error(
+                    terminal,
+                    &settings.keys,
+                    "No fresh supported GC teams detected.",
+                )?;
+            }
+            Some(2 | 3) => {
                 if let Some(path) = pick_session(terminal, settings)? {
-                    return Ok(Some(if choice == Some(1) {
+                    return Ok(Some(if choice == Some(2) {
                         Launch::Resume(path)
                     } else {
                         Launch::Postgame(Some(path))
                     }));
                 }
             }
-            Some(3) => {
+            Some(4) => {
                 if let Some(path) = pick_session(terminal, settings)? {
                     manage(terminal, settings, &path)?;
                 }
             }
-            Some(4) => edit_settings(terminal, settings)?,
+            Some(5) => edit_settings(terminal, settings)?,
             Some(index) if (recent_start..recent_start + recent.len()).contains(&index) => {
                 let path = &recent[index - recent_start];
                 match choose(
