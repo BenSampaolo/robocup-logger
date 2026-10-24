@@ -152,3 +152,7 @@ fn interface_broadcasts(text: &str) -> Vec<Ipv4Addr> {
         })
         .collect()
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/discovery.rs"]
+mod tests;

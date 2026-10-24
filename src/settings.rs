@@ -161,3 +161,7 @@ fn regular_file_exists(path: &Path) -> io::Result<bool> {
         )),
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/settings.rs"]
+mod tests;

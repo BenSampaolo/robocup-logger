@@ -1203,3 +1203,7 @@ pub fn open_tabs(links: &[String]) -> io::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/postgame.rs"]
+mod tests;

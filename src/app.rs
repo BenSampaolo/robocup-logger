@@ -1599,3 +1599,7 @@ fn edit_key(editor: &mut TextArea<'static>, key: KeyEvent) -> bool {
         _ => false,
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/app.rs"]
+mod tests;

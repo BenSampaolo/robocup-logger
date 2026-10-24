@@ -540,3 +540,7 @@ fn process_error(context: &str, path: &Path) -> String {
         }
     )
 }
+
+#[cfg(all(test, unix))]
+#[path = "../tests/unit/audio.rs"]
+mod tests;

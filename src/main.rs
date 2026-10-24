@@ -20,6 +20,9 @@ mod teams;
 mod transcript_viewer;
 mod ui;
 
+#[cfg(test)]
+#[path = "../tests/unit/support.rs"]
+mod test_support;
 
 use std::{env, io, path::PathBuf, time::Duration};
 

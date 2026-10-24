@@ -805,3 +805,7 @@ pub(crate) fn markdown_text(text: &str) -> String {
     }
     escaped
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/model.rs"]
+mod tests;

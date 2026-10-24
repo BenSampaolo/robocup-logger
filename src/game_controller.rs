@@ -743,3 +743,7 @@ impl Receiver {
         )
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/controller.rs"]
+mod tests;

@@ -393,3 +393,7 @@ fn render(info: &MeetingInfo, markers: &[Marker], transcript: &Transcript) -> St
     }
     output
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/meeting.rs"]
+mod tests;

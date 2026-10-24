@@ -233,3 +233,7 @@ fn check_regular_file(path: &Path) -> io::Result<()> {
 fn invalid_data(error: impl ToString) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/capture.rs"]
+mod tests;

@@ -296,3 +296,7 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8], replace: bool) -> io::R
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/storage.rs"]
+mod tests;
