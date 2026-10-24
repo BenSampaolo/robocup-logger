@@ -1,4 +1,4 @@
-// GameController v7.0.0-rc.3 config/teams.yaml, embedded for portable binaries.
+// GameController v7.0.0-rc.3 config/teams.yaml plus local additions, embedded for portable binaries.
 pub(crate) const TEAMS: &[(u8, &str)] = &[
     (0, "Invisibles"),
     (1, "NUbots"),
@@ -66,6 +66,8 @@ pub(crate) const TEAMS: &[(u8, &str)] = &[
     (63, "WHU United"),
     (64, "ZETIN"),
     (70, "B-Team"),
+    (101, "FC Isar robotics"),
+    (102, "foom bots"),
 ];
 
 pub fn team_number(name: &str) -> Option<u8> {
