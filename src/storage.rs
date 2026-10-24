@@ -10,7 +10,16 @@ pub struct Store {
     session_path: PathBuf,
     markdown_path: PathBuf,
     // Lock an inode that is never replaced by an atomic save or deleted on exit.
-    _lock: File,
+    _lock: SessionLock,
+}
+
+struct SessionLock(File);
+
+impl Drop for SessionLock {
+    fn drop(&mut self) {
+        // Closing our descriptor alone can leave an inherited flock held until a child execs/exits.
+        let _ = self.0.unlock();
+    }
 }
 
 impl Store {
@@ -186,7 +195,7 @@ fn invalid_data(error: impl ToString) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
-fn regular_file_exists(path: &Path) -> io::Result<bool> {
+pub(crate) fn regular_file_exists(path: &Path) -> io::Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => Ok(true),
         Ok(_) => Err(invalid_data(format!(
@@ -198,7 +207,7 @@ fn regular_file_exists(path: &Path) -> io::Result<bool> {
     }
 }
 
-fn lock_session(path: &Path) -> io::Result<File> {
+fn lock_session(path: &Path) -> io::Result<SessionLock> {
     let exists = regular_file_exists(path)?;
     let file = OpenOptions::new()
         .read(true)
@@ -215,7 +224,7 @@ fn lock_session(path: &Path) -> io::Result<File> {
         ),
         std::fs::TryLockError::Error(error) => error,
     })?;
-    Ok(file)
+    Ok(SessionLock(file))
 }
 
 fn generated_markdown_exists(path: &Path) -> io::Result<bool> {
@@ -237,7 +246,7 @@ fn generated_markdown_exists(path: &Path) -> io::Result<bool> {
     )))
 }
 
-fn atomic_write(path: &Path, contents: &[u8], replace: bool) -> io::Result<()> {
+pub(crate) fn atomic_write(path: &Path, contents: &[u8], replace: bool) -> io::Result<()> {
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
     let directory = path
         .parent()

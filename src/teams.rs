@@ -1,5 +1,5 @@
 // GameController v7.0.0-rc.3 config/teams.yaml, embedded for portable binaries.
-const TEAMS: &[(u8, &str)] = &[
+pub(crate) const TEAMS: &[(u8, &str)] = &[
     (0, "Invisibles"),
     (1, "NUbots"),
     (2, "Bold Hearts"),
@@ -84,4 +84,8 @@ pub fn team_name(number: u8) -> Option<&'static str> {
         .iter()
         .find(|(team, _)| *team == number)
         .map(|(_, name)| *name)
+}
+
+pub fn display_name(number: u8) -> String {
+    team_name(number).map_or_else(|| format!("#{number}"), str::to_owned)
 }

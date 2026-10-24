@@ -1,13 +1,25 @@
 mod app;
+mod audio;
 mod capture;
 mod controller_app;
+mod discovery;
+mod folders;
 mod game_controller;
+mod launcher;
+mod meeting;
 mod model;
+mod navigation;
+mod postgame;
+mod presentation;
 mod rebuild;
+mod recent;
+mod settings;
 mod statistics;
 mod storage;
 mod teams;
+mod transcript_viewer;
 mod ui;
+
 
 use std::{env, io, path::PathBuf, time::Duration};
 
@@ -23,9 +35,18 @@ fn main() -> io::Result<()> {
     let path = args.next();
     if path.as_deref().is_some_and(|s| s == "--help" || s == "-h") {
         println!(
-            "robocup-logger [SESSION.json]\nrobocup-logger export SESSION.json\nrobocup-logger rebuild SESSION.json\n\nNo argument: set up a new match. Pass a session JSON to resume.\nexport: regenerate its .md without the UI or modifying JSON; close the session first.\nrebuild: backfill missing GC statistics from .gc.jsonl, preserving edits, then export.\nSetup defaults to Golden Goal + official in one log; standalone types remain available.\nOfficial follows only after Golden Goal ends and the opponent changes on the same GC source.\nNew Markdown uses GC countdowns; JSON keeps both GC and wall-clock times.\nEnter starts/submits notes. Tab captures both times and opens actions.\nTab then g: start current game; t: test start; f: end current game.\nAfter combined test ends, g starts official manually with GC off.\nTab then l: toggle v20 GC listening (true data requested automatically on detection).\nTab then v: switch between true data and broadcasts.\nTab then d/y removes an event; Tab then b restores it.\nEsc returns from actions. Tab then q saves and quits; Tab then w retries saving.\nForms: select Create/Apply with Tab or arrows, then press Enter.\nFunction-key and Ctrl shortcuts remain optional aliases."
+            "robocup-logger [SESSION.json]\nrobocup-logger postgame [SESSION.json]\nrobocup-logger export SESSION.json\nrobocup-logger rebuild SESSION.json\n\nNo argument: Home menu with New match, Resume, Postgame, Manage, and Settings.\npostgame without a path: choose a session in the built-in picker.\nPass a session JSON directly to resume live logging.\nMenus: arrows / HJKL / WASD, Enter or Space to select, Esc to go back or open actions, ? for help. Tab is unused.\nBindings and new-match defaults are configurable in Settings. Text editors accept literal text.\nLive logging: Enter immediately timestamps a new note; Enter/Esc saves it. Esc when idle opens actions.\nForms: Esc leaves field editing first; leaving changed drafts asks before discarding.\nPostgame: Esc opens the meeting menu; choose Finish to confirm ending and transcribe locally by note/task. Recording requires consent at meeting start.\nLeaving Home asks for confirmation, defaulting to Cancel.\nManage: browse recordings, regenerate Markdown, or rebuild missing GC statistics.\nexport: regenerate .md without changing JSON; close the live logger first.\nrebuild: backfill missing statistics from .gc.jsonl, preserving edits, then export.\nNo model downloads, automatic microphone activation, or automatic GitHub submission."
         );
         return Ok(());
+    }
+    if path.as_deref().is_some_and(|s| s == "postgame") {
+        let json = args.next().map(PathBuf::from);
+        if args.next().is_some() {
+            return Err(io::Error::other(
+                "Usage: robocup-logger postgame [SESSION.json]",
+            ));
+        }
+        return interactive(Some(launcher::Launch::Postgame(json)));
     }
     if path
         .as_deref()
@@ -58,30 +79,85 @@ fn main() -> io::Result<()> {
     }
     if args.next().is_some() {
         return Err(io::Error::other(
-            "Usage: robocup-logger [SESSION.json] | export|rebuild SESSION.json",
+            "Usage: robocup-logger [SESSION.json] | export|rebuild|postgame SESSION.json",
         ));
     }
-    let mut app = app::App::new(path.map(PathBuf::from).as_deref())?;
+    interactive(path.map(|path| launcher::Launch::Resume(PathBuf::from(path))))
+}
+
+fn interactive(initial: Option<launcher::Launch>) -> io::Result<()> {
+    let mut settings = settings::Settings::load()?;
+    let home = initial.is_none();
+    let mut next = initial;
     let mut terminal = enter_terminal()?;
-    let result = run(&mut terminal, &mut app);
+    let result = (|| {
+        loop {
+            let launch = match next.take() {
+                Some(launch) => launch,
+                None => match launcher::run(&mut terminal, &mut settings)? {
+                    Some(launch) => launch,
+                    None => return Ok(()),
+                },
+            };
+            let workflow = (|| -> io::Result<()> {
+                match launch {
+                    launcher::Launch::New | launcher::Launch::Resume(_) => {
+                        let path = match &launch {
+                            launcher::Launch::Resume(path) => Some(path.as_path()),
+                            _ => None,
+                        };
+                        let mut app = app::App::new_with_settings(path, &settings)?;
+                        run(&mut terminal, &mut app)?;
+                    }
+                    launcher::Launch::Postgame(path) => {
+                        let path = match path {
+                            Some(path) => path,
+                            None => match launcher::pick_session(&mut terminal, &settings)? {
+                                Some(path) => path,
+                                None => return Ok(()),
+                            },
+                        };
+                        let (store, session) = storage::Store::load(&path)?;
+                        if let Err(error) = recent::remember(store.session_path()) {
+                            launcher::show_error(
+                                &mut terminal,
+                                &settings.keys,
+                                &format!("Cannot update recent sessions: {error}"),
+                            )?;
+                        }
+                        let links =
+                            postgame::run_with_settings(&mut terminal, &store, session, &settings)?;
+                        if !links.is_empty() {
+                            restore_terminal()?;
+                            let opened = postgame::open_tabs(&links);
+                            terminal = enter_terminal()?;
+                            opened?;
+                        }
+                    }
+                }
+                Ok(())
+            })();
+            if !home {
+                return workflow;
+            }
+            if let Err(error) = workflow {
+                launcher::show_error(&mut terminal, &settings.keys, &error.to_string())?;
+            }
+        }
+    })();
     let cleanup = restore_terminal();
-    result.and(cleanup)?;
-    if let Some(store) = &app.store {
-        println!(
-            "Log: {}\nResume: robocup-logger '{}'",
-            store.markdown_path().display(),
-            store.session_path().display()
-        );
-    }
-    Ok(())
+    result.and(cleanup)
 }
 
 fn enter_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
-    let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = restore_terminal();
-        previous_hook(info);
-    }));
+    static PANIC_HOOK: std::sync::Once = std::sync::Once::new();
+    PANIC_HOOK.call_once(|| {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = restore_terminal();
+            previous_hook(info);
+        }));
+    });
     enable_raw_mode()?;
     let result = (|| {
         execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
@@ -103,10 +179,18 @@ fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut app::App,
 ) -> io::Result<()> {
+    let mut remembered = false;
     loop {
+        app.poll_discovery();
         app.poll_controller();
         if app.save_error.is_none() {
             app.persist();
+        }
+        if !remembered && let Some(store) = &app.store {
+            remembered = true;
+            if let Err(error) = recent::remember(store.session_path()) {
+                app.status = format!("Cannot update recent sessions: {error}");
+            }
         }
         terminal.draw(|frame| ui::draw(frame, app))?;
         if !event::poll(Duration::from_millis(100))? {

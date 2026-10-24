@@ -88,13 +88,13 @@ impl Aggregate {
                 }
             };
             if official {
-                aggregate.entry(entry, session.metadata.hulks_are_home());
+                aggregate.entry(entry, session.metadata.tracked_are_home());
             }
         }
         aggregate
     }
 
-    fn entry(&mut self, entry: &Entry, hulks_are_home: bool) {
+    fn entry(&mut self, entry: &Entry, tracked_are_home: bool) {
         let goal = matches!(entry.kind, EventKind::GoalHome | EventKind::GoalAway);
         let score_changed = entry.score_delta.is_some_and(|delta| delta != [0, 0]);
         if (goal || score_changed) && !self.observed {
@@ -116,7 +116,7 @@ impl Aggregate {
             self.observe(statistics);
         }
         if goal {
-            if (entry.kind == EventKind::GoalHome) == hulks_are_home {
+            if (entry.kind == EventKind::GoalHome) == tracked_are_home {
                 self.current_run += 1;
                 self.longest_run = self.longest_run.max(self.current_run);
             } else {
@@ -203,7 +203,8 @@ pub(crate) fn markdown(session: &Session) -> Option<String> {
         return None;
     }
     let (home, away) = session.raw_score_for(MatchType::Official);
-    let goals = if session.metadata.hulks_are_home() {
+    let tracked = markdown_text(session.metadata.tracked_team_name());
+    let goals = if session.metadata.tracked_are_home() {
         home
     } else {
         away
@@ -269,17 +270,17 @@ pub(crate) fn markdown(session: &Session) -> Option<String> {
         }
     };
     output.push_str(&format!(
-        "- Goal share: {share} ({goals} HULKs goals, {} observed opponent goal-kicks/kick-ins)\n",
+        "- Goal share: {share} ({goals} {tracked} goals, {} observed opponent goal-kicks/kick-ins)\n",
         aggregate.opponent_restarts,
     ));
     if aggregate.peak_penalties >= 2 {
         output.push_str(&format!(
-            "- Peak observed simultaneous penalties: {} HULKs\n",
+            "- Peak observed simultaneous penalties: {} {tracked}\n",
             aggregate.peak_penalties,
         ));
     } else if complete && aggregate.run_available && aggregate.longest_run >= 3 {
         output.push_str(&format!(
-            "- Longest HULKs unanswered scoring run: {} goals\n",
+            "- Longest {tracked} unanswered scoring run: {} goals\n",
             aggregate.longest_run,
         ));
     }

@@ -15,12 +15,22 @@ impl App {
                     && !self.pending_controller.iter().any(|update| {
                         session
                             .golden_goal_opponent
-                            .is_some_and(|opponent| update.snapshot.opponent_number != opponent)
+                            .is_some_and(|opponent| update.snapshot.starts_official_after(opponent))
                     })
             });
+            controller.allow_same_opponent_restart = self.session.as_ref().and_then(|session| {
+                controller
+                    .allow_opponent_change
+                    .then_some(session.golden_goal_opponent)
+                    .flatten()
+            });
             controller.ignored_opponent = self.session.as_ref().and_then(|session| {
+                let official_opponent = session
+                    .official_opponent
+                    .or_else(|| crate::teams::team_number(session.metadata.opponent_name()));
                 (session.match_type == Some(MatchType::Combined)
-                    && session.current_game() == MatchType::Official)
+                    && session.current_game() == MatchType::Official
+                    && official_opponent != session.golden_goal_opponent)
                     .then_some(session.golden_goal_opponent)
                     .flatten()
             });
@@ -35,7 +45,7 @@ impl App {
                 }
                 Err(error) => {
                     self.controller_error = Some(format!(
-                        "GC receive failed: {error}; Tab, L stops listening"
+                        "GC receive failed: {error}; Actions → Pause GC logging"
                     ))
                 }
             }
@@ -51,7 +61,7 @@ impl App {
                     {
                         if finished
                             && test_opponent
-                                .is_some_and(|opponent| opponent != snapshot.opponent_number)
+                                .is_some_and(|opponent| snapshot.starts_official_after(opponent))
                         {
                             game = MatchType::Official;
                             finished = false;
@@ -75,9 +85,13 @@ impl App {
                 }
                 for packet in &mut captures {
                     let snapshot = if packet.accepted {
-                        decode_capture(&packet.packet, packet.true_data)
-                            .ok()
-                            .flatten()
+                        decode_capture(
+                            &packet.packet,
+                            packet.true_data,
+                            session.metadata.tracked_team_number(),
+                        )
+                        .ok()
+                        .flatten()
                     } else {
                         None
                     };
@@ -89,7 +103,7 @@ impl App {
             }
             self.pending_capture.extend(captures);
         }
-        // Tab captured an earlier moment: apply its event before later controller events.
+        // Opening Actions captured an earlier moment: apply its event before later controller events.
         if !matches!(self.mode, Mode::Actions { .. }) {
             self.flush_controller();
         }
@@ -120,10 +134,17 @@ impl App {
         let transitioning = combined
             && current_game == MatchType::GoldenGoal
             && session.is_finished()
-            && opponent_changed;
+            && session
+                .golden_goal_opponent
+                .is_some_and(|opponent| snapshot.starts_official_after(opponent));
         if combined
             && ((current_game == MatchType::GoldenGoal && opponent_changed && !transitioning)
-                || (current_game == MatchType::Official && !opponent_changed))
+                || (current_game == MatchType::Official
+                    && !opponent_changed
+                    && session
+                        .official_opponent
+                        .or_else(|| crate::teams::team_number(session.metadata.opponent_name()))
+                        != session.golden_goal_opponent))
         {
             return;
         }
@@ -149,7 +170,7 @@ impl App {
         }
         let golden_goal_message_budget = if session.match_type.is_none() && session.in_golden_goal()
         {
-            previous.map(|packet| packet.hulks_message_budget)
+            previous.map(|packet| packet.tracked_message_budget)
         } else {
             None
         };
@@ -157,15 +178,15 @@ impl App {
         let sync = previous.is_none()
             || (official && previous.is_some_and(|p| p.game_phase != snapshot.game_phase));
         let oriented = |packet: &Snapshot| {
-            if session.metadata.hulks_are_home() {
+            if session.metadata.tracked_are_home() {
                 (
-                    i64::from(packet.hulks_score),
+                    i64::from(packet.tracked_score),
                     i64::from(packet.opponent_score),
                 )
             } else {
                 (
                     i64::from(packet.opponent_score),
-                    i64::from(packet.hulks_score),
+                    i64::from(packet.tracked_score),
                 )
             }
         };
@@ -271,18 +292,18 @@ impl App {
                 });
                 Statistics {
                     baseline: previous.is_none().then_some(StatisticsBaseline {
-                        penalties: snapshot.hulks_penalties,
+                        penalties: snapshot.tracked_penalties,
                         pre_game: snapshot.game_phase == 0
                             && snapshot.first_half
                             && snapshot.state == 0
-                            && snapshot.hulks_score == 0
+                            && snapshot.tracked_score == 0
                             && snapshot.opponent_score == 0,
                     }),
                     penalties: previous.map_or_else(Vec::new, |packet| {
                         packet
-                            .hulks_penalties
+                            .tracked_penalties
                             .iter()
-                            .zip(snapshot.hulks_penalties)
+                            .zip(snapshot.tracked_penalties)
                             .enumerate()
                             .filter_map(|(player, (&before, after))| {
                                 (before != after).then_some(PenaltyChange {
@@ -304,6 +325,11 @@ impl App {
             });
         let follow = matches!(self.mode, Mode::Idle | Mode::Writing)
             && self.history.selected() == session.entries.len().checked_sub(1);
+        if target_game == MatchType::Official
+            && (transitioning || session.official_opponent.is_none())
+        {
+            session.official_opponent = Some(snapshot.opponent_number);
+        }
         session.record(kind, update.received_at);
         let entry = session.entries.last_mut().unwrap();
         if combined {
@@ -312,7 +338,7 @@ impl App {
         entry.capture_id = update.capture_id;
         entry.from_controller = true;
         entry.gc_seconds_remaining = Some(snapshot.seconds_remaining);
-        entry.message_budget = Some(snapshot.hulks_message_budget);
+        entry.message_budget = Some(snapshot.tracked_message_budget);
         entry.golden_goal_message_budget = golden_goal_message_budget;
         entry.statistics = statistics;
         if !matches!(kind, EventKind::GoalHome | EventKind::GoalAway) && delta != [0, 0] {
@@ -332,7 +358,8 @@ impl App {
             .filter(|statistics| !statistics.penalties.is_empty())
             .map(|statistics| {
                 format!(
-                    "HULKs penalties: {}; ",
+                    "{} penalties: {}; ",
+                    session.metadata.tracked_team_name(),
                     statistics
                         .penalties
                         .iter()

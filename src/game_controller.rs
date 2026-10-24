@@ -24,9 +24,9 @@ pub struct Snapshot {
     pub kicking_team: u8,
     pub seconds_remaining: i16,
     pub secondary_time: i16,
-    pub hulks_score: u8,
-    pub hulks_message_budget: u16,
-    pub hulks_penalties: [u8; 20],
+    pub tracked_score: u8,
+    pub tracked_message_budget: u16,
+    pub tracked_penalties: [u8; 20],
     pub opponent_score: u8,
     pub opponent_number: u8,
 }
@@ -65,7 +65,7 @@ impl Snapshot {
         let kicking_team = if self.kicking_team == 255 {
             "none".to_owned()
         } else {
-            self.kicking_team.to_string()
+            crate::teams::display_name(self.kicking_team)
         };
         format!(
             "{phase} / {state} / {} half; set play: {set_play}; kicking team: {kicking_team}; stopped: {}; clock {}; secondary {}",
@@ -76,8 +76,17 @@ impl Snapshot {
         )
     }
 
+    pub(crate) fn starts_official_after(&self, golden_goal_opponent: u8) -> bool {
+        self.opponent_number != golden_goal_opponent
+            || (self.game_phase == 0
+                && self.first_half
+                && matches!(self.state, 0..=2)
+                && self.tracked_score == 0
+                && self.opponent_score == 0)
+    }
+
     fn same_game_state(&self, other: &Self) -> bool {
-        self.same_match_state(other) && self.hulks_penalties == other.hulks_penalties
+        self.same_match_state(other) && self.tracked_penalties == other.tracked_penalties
     }
 
     pub(crate) fn same_match_state(&self, other: &Self) -> bool {
@@ -87,7 +96,7 @@ impl Snapshot {
             && self.first_half == other.first_half
             && self.stopped == other.stopped
             && self.kicking_team == other.kicking_team
-            && self.hulks_score == other.hulks_score
+            && self.tracked_score == other.tracked_score
             && self.opponent_score == other.opponent_score
             && self.opponent_number == other.opponent_number
     }
@@ -104,15 +113,19 @@ pub(crate) fn format_clock(seconds: i16) -> String {
 }
 
 // v20 layout: https://github.com/RoboCup-SPL/GameController/blob/7194909358cc6f93fecac93d3a08cbe6c17bd888/src/data/GameControlData.java
-fn parse(packet: &[u8]) -> Result<Option<Snapshot>, String> {
-    parse_feed(packet, false)
+pub(crate) fn decode_capture(
+    packet: &[u8],
+    true_data: bool,
+    tracked_team: u8,
+) -> Result<Option<Snapshot>, String> {
+    parse_team_feed(packet, true_data, tracked_team)
 }
 
-pub(crate) fn decode_capture(packet: &[u8], true_data: bool) -> Result<Option<Snapshot>, String> {
-    parse_feed(packet, true_data)
-}
-
-fn parse_feed(packet: &[u8], true_data: bool) -> Result<Option<Snapshot>, String> {
+fn parse_team_feed(
+    packet: &[u8],
+    true_data: bool,
+    tracked_team: u8,
+) -> Result<Option<Snapshot>, String> {
     let (selected, ignored) = if true_data {
         (b"RGTD", b"RGme")
     } else {
@@ -149,12 +162,12 @@ fn parse_feed(packet: &[u8], true_data: bool) -> Result<Option<Snapshot>, String
         return Err("Ignored GameController v20 packet: invalid state or enum value".to_owned());
     }
 
-    let (hulks, opponent) = match (packet[18], packet[88]) {
-        (HULKS_TEAM_NUMBER, HULKS_TEAM_NUMBER) => {
-            return Err("Ignored GameController packet: duplicate HULKs team ID".to_owned());
+    let (tracked, opponent) = match (packet[18] == tracked_team, packet[88] == tracked_team) {
+        (true, true) => {
+            return Err("Ignored GameController packet: duplicate tracked team ID".to_owned());
         }
-        (HULKS_TEAM_NUMBER, _) => (18, 88),
-        (_, HULKS_TEAM_NUMBER) => (88, 18),
+        (true, false) => (18, 88),
+        (false, true) => (88, 18),
         _ => return Ok(None),
     };
     if packet[13] != 255 && packet[13] != packet[18] && packet[13] != packet[88] {
@@ -171,9 +184,9 @@ fn parse_feed(packet: &[u8], true_data: bool) -> Result<Option<Snapshot>, String
         kicking_team: packet[13],
         seconds_remaining: i16::from_le_bytes([packet[14], packet[15]]),
         secondary_time: i16::from_le_bytes([packet[16], packet[17]]),
-        hulks_score: packet[hulks + 4],
-        hulks_message_budget: u16::from_le_bytes([packet[hulks + 8], packet[hulks + 9]]),
-        hulks_penalties: std::array::from_fn(|player| packet[hulks + 10 + 3 * player]),
+        tracked_score: packet[tracked + 4],
+        tracked_message_budget: u16::from_le_bytes([packet[tracked + 8], packet[tracked + 9]]),
+        tracked_penalties: std::array::from_fn(|player| packet[tracked + 10 + 3 * player]),
         opponent_score: packet[opponent + 4],
         opponent_number: packet[opponent],
     }))
@@ -187,8 +200,19 @@ pub struct Update {
     pub capture_id: Option<u64>,
 }
 
+struct Detection {
+    source: SocketAddr,
+    teams: (u8, u8),
+    received_at: Instant,
+}
+
 pub struct Receiver {
     socket: UdpSocket,
+    probe: crate::discovery::Probe,
+    detected: Option<Detection>,
+    discovery_only: bool,
+    source_from_request: bool,
+    tracked_team: u8,
     capture_enabled: bool,
     next_capture_id: u64,
     pub captures: Vec<Packet>,
@@ -202,7 +226,10 @@ pub struct Receiver {
     pub true_data: bool,
     auto_true_data: bool,
     pub allow_opponent_change: bool,
+    pub allow_same_opponent_restart: Option<u8>,
     pub ignored_opponent: Option<u8>,
+    acquisition_opponent: Option<u8>,
+    pub awaiting_official_start: bool,
     pub latest: Option<Snapshot>,
     pub received_at: Option<Instant>,
     pub source: Option<SocketAddr>,
@@ -210,11 +237,27 @@ pub struct Receiver {
 }
 
 impl Receiver {
-    pub fn bind() -> io::Result<Self> {
+    pub fn bind(tracked_team: u8, configured_opponent: Option<u8>) -> io::Result<Self> {
+        if crate::teams::team_name(tracked_team).is_none()
+            || configured_opponent.is_some_and(|opponent| {
+                opponent == tracked_team || crate::teams::team_name(opponent).is_none()
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Choose two distinct supported teams",
+            ));
+        }
         let socket = UdpSocket::bind("0.0.0.0:3838")?;
         socket.set_nonblocking(true)?;
+        socket.set_broadcast(true)?;
         Ok(Self {
             socket,
+            probe: crate::discovery::Probe::enabled(),
+            detected: None,
+            discovery_only: false,
+            source_from_request: false,
+            tracked_team,
             capture_enabled: false,
             next_capture_id: 0,
             captures: Vec::new(),
@@ -228,7 +271,10 @@ impl Receiver {
             true_data: false,
             auto_true_data: true,
             allow_opponent_change: false,
+            allow_same_opponent_restart: None,
             ignored_opponent: None,
+            acquisition_opponent: None,
+            awaiting_official_start: false,
             latest: None,
             received_at: None,
             source: None,
@@ -242,6 +288,11 @@ impl Receiver {
         socket.set_nonblocking(true).unwrap();
         Self {
             socket,
+            probe: crate::discovery::Probe::default(),
+            detected: None,
+            discovery_only: false,
+            source_from_request: false,
+            tracked_team: HULKS_TEAM_NUMBER,
             capture_enabled: false,
             next_capture_id: 0,
             captures: Vec::new(),
@@ -252,14 +303,76 @@ impl Receiver {
             last_true_data_request: None,
             request_destination: None,
             true_data: false,
-            // Existing fixtures exercise broadcast mode; discovery tests opt in.
+            // Synthetic fixtures start without active discovery requests.
             auto_true_data: false,
             allow_opponent_change: false,
+            allow_same_opponent_restart: None,
             ignored_opponent: None,
+            acquisition_opponent: None,
+            awaiting_official_start: false,
             latest: None,
             received_at: None,
             source: None,
             notice: None,
+        }
+    }
+
+    pub(crate) fn bind_discovery() -> io::Result<Self> {
+        let mut receiver = Self::bind(HULKS_TEAM_NUMBER, None)?;
+        receiver.discovery_only = true;
+        Ok(receiver)
+    }
+
+    pub(crate) fn detected_teams(&self) -> Option<(u8, u8)> {
+        let detected = self.detected.as_ref()?;
+        (detected.received_at.elapsed() <= STALE_AFTER
+            && detected.teams.0 != detected.teams.1
+            && crate::teams::team_name(detected.teams.0).is_some()
+            && crate::teams::team_name(detected.teams.1).is_some())
+        .then_some(detected.teams)
+    }
+
+    pub(crate) fn discovery_status(&self) -> (String, bool) {
+        if let Some(detected) = &self.detected {
+            let age = detected.received_at.elapsed();
+            if age <= STALE_AFTER {
+                return (
+                    format!(
+                        "GC reachable at {} • {} / {}",
+                        detected.source.ip(),
+                        crate::teams::display_name(detected.teams.0),
+                        crate::teams::display_name(detected.teams.1)
+                    ),
+                    true,
+                );
+            }
+            return (
+                format!("GC no recent response • last seen {}", detected.source.ip()),
+                false,
+            );
+        }
+        if let Some(error) = &self.probe.error {
+            return (format!("GC discovery request failed: {error}"), false);
+        }
+        (
+            "GC searching: 10.0.0.10 + LAN • no response yet".into(),
+            false,
+        )
+    }
+
+    fn observe_detection(&mut self, bytes: &[u8], source: SocketAddr, now: Instant) {
+        let Some(&first_team) = bytes.get(18) else {
+            return;
+        };
+        let true_data = bytes.get(..4) == Some(b"RGTD");
+        if (self.discovery_only || self.source.is_none_or(|pinned| pinned.ip() == source.ip()))
+            && let Ok(Some(snapshot)) = parse_team_feed(bytes, true_data, first_team)
+        {
+            self.detected = Some(Detection {
+                source,
+                teams: (first_team, snapshot.opponent_number),
+                received_at: now,
+            });
         }
     }
 
@@ -272,11 +385,36 @@ impl Receiver {
         self.next_capture_id
     }
 
+    pub(crate) fn opponent_number(&self) -> Option<u8> {
+        self.opponent_number
+    }
+
+    pub(crate) fn reconnect(&mut self, opponent: u8) {
+        // Keep the socket, capture IDs and history owner; only explicit action unpins IPs.
+        self.acquisition_opponent = Some(opponent);
+        self.opponent_number = None;
+        self.source = None;
+        self.source_from_request = false;
+        self.true_source = None;
+        self.retired_true_source = None;
+        self.last_true_receipt = None;
+        self.last_true_data_request = None;
+        self.true_data = false;
+        self.auto_true_data = true;
+        self.detected = None;
+        self.ignored_opponent = None;
+        self.allow_opponent_change = false;
+        self.allow_same_opponent_restart = None;
+        self.awaiting_official_start = false;
+        self.notice = None;
+        self.rebaseline();
+    }
+
     pub fn set_true_data(&mut self, enabled: bool) -> io::Result<()> {
         if enabled && self.source.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
-                "Wait for a GameController broadcast before requesting true data",
+                "Wait for a GameController discovery response before selecting a feed",
             ));
         }
         self.auto_true_data = false;
@@ -312,25 +450,64 @@ impl Receiver {
             };
             let received_at = Local::now().fixed_offset();
             let now = Instant::now();
+            self.observe_detection(&buffer[..length], source, now);
+            if self.discovery_only {
+                continue;
+            }
+            // A monitor reply can establish the source without any RGme broadcast.
+            if self.auto_true_data
+                && self.source.is_none()
+                && buffer[..length].get(..4) == Some(b"RGTD")
+                && let Ok(Some(snapshot)) =
+                    parse_team_feed(&buffer[..length], true, self.tracked_team)
+                && self.ignored_opponent != Some(snapshot.opponent_number)
+                && self
+                    .acquisition_opponent
+                    .is_none_or(|opponent| opponent == snapshot.opponent_number)
+            {
+                self.source = Some(source);
+                self.source_from_request = true;
+                self.set_true_data(true)?;
+            }
             let true_data = self.true_data;
-            let parsed = if true_data {
-                parse_feed(&buffer[..length], true)
-            } else {
-                parse(&buffer[..length])
-            };
+            let parsed = parse_team_feed(&buffer[..length], true_data, self.tracked_team);
             let (accepted, mut update) = match parsed {
                 Ok(Some(snapshot)) => {
+                    let handover = (
+                        self.allow_opponent_change,
+                        self.allow_same_opponent_restart,
+                        self.awaiting_official_start,
+                    );
                     let (accepted, update) = self.accept_packet(snapshot, source, now, received_at);
                     if update.is_some() && self.auto_true_data {
                         // Discover the controller, not its delayed match state/opponent.
                         self.set_true_data(true)?;
                         self.opponent_number = None;
+                        (
+                            self.allow_opponent_change,
+                            self.allow_same_opponent_restart,
+                            self.awaiting_official_start,
+                        ) = handover;
                         (false, None)
                     } else {
                         (accepted, update)
                     }
                 }
-                Ok(None) => (false, None),
+                Ok(None) => {
+                    let header = if true_data { b"RGTD" } else { b"RGme" };
+                    if self.latest.is_none()
+                        && length == PACKET_SIZE
+                        && buffer.get(..4) == Some(header)
+                    {
+                        self.notice = Some(format!(
+                            "GC detected: {} vs {}; waiting for {}",
+                            crate::teams::display_name(buffer[18]),
+                            crate::teams::display_name(buffer[88]),
+                            crate::teams::display_name(self.tracked_team)
+                        ));
+                    }
+                    (false, None)
+                }
                 Err(notice) => {
                     let (header, pinned) = if self.true_data {
                         (b"RGTD", self.true_source)
@@ -371,6 +548,16 @@ impl Receiver {
             if let Some(update) = update {
                 updates.push(update);
             }
+        }
+        if (self.discovery_only || self.auto_true_data)
+            && self.source.is_none()
+            && (!self.discovery_only
+                || self
+                    .detected
+                    .as_ref()
+                    .is_none_or(|detected| detected.received_at.elapsed() > STALE_AFTER))
+        {
+            self.probe.request(&self.socket, Instant::now());
         }
         if let Err(error) = self.request_true_data(Instant::now()) {
             self.notice = Some(format!("GameController true-data request failed: {error}"));
@@ -454,6 +641,9 @@ impl Receiver {
         received_at: DateTime<FixedOffset>,
     ) -> (bool, Option<Update>) {
         if self.ignored_opponent == Some(snapshot.opponent_number)
+            || self
+                .acquisition_opponent
+                .is_some_and(|opponent| opponent != snapshot.opponent_number)
             || (self.true_data && self.retired_true_source == Some(source))
         {
             return (false, None);
@@ -462,11 +652,17 @@ impl Receiver {
             self.source.is_some_and(|pinned| pinned.ip() == source.ip())
                 && self.true_source.is_none_or(|pinned| pinned == source)
         } else {
-            self.source.is_none_or(|pinned| pinned == source)
+            self.source.is_none_or(|pinned| {
+                if self.source_from_request {
+                    pinned.ip() == source.ip()
+                } else {
+                    pinned == source
+                }
+            })
         };
         if !source_matches {
             self.notice = Some(format!(
-                "Ignored GameController source {source}; toggle GC off/on to switch controller"
+                "Ignored GameController source {source}; Actions → Reconnect/switch GC to reacquire"
             ));
             return (false, None);
         }
@@ -475,13 +671,22 @@ impl Receiver {
             .is_some_and(|pinned| pinned != snapshot.opponent_number);
         if opponent_changed && !self.allow_opponent_change {
             self.notice = Some(format!(
-                "Ignored GameController opponent {}; toggle GC off/on to switch opponent",
-                snapshot.opponent_number
+                "Ignored GameController opponent {}; reconnect only accepts the current match",
+                crate::teams::display_name(snapshot.opponent_number)
             ));
             return (false, None);
         }
-        // A new game can reset its sequence counter even without a stale interval.
+        let same_opponent_restart = self.allow_same_opponent_restart.is_some_and(|opponent| {
+            snapshot.opponent_number == opponent && snapshot.starts_official_after(opponent)
+        });
+        // Do not import a late test end into a newly observed same-opponent pregame.
+        // Reconnect explicitly clears this guard if Playing was never observed.
+        if self.awaiting_official_start && snapshot.state == 4 {
+            return (false, None);
+        }
+        // Positive match-reset evidence, not a recreated UDP sender, permits a new sequence.
         let mut previous = if opponent_changed
+            || same_opponent_restart
             || self.is_stale_at(now)
             || (self.true_data && self.true_source.is_none())
         {
@@ -507,13 +712,23 @@ impl Receiver {
             self.last_true_receipt = Some(now);
         } else {
             self.source = Some(source);
+            self.source_from_request = false;
         }
         // A reopened receiver may attach directly to the new game. Pin that first
         // opponent for the rest of this batch as well, until the app imports it.
-        if opponent_changed || self.opponent_number.is_none() {
+        if opponent_changed || same_opponent_restart || self.opponent_number.is_none() {
             self.allow_opponent_change = false;
+            self.allow_same_opponent_restart = None;
+        }
+        if same_opponent_restart {
+            self.awaiting_official_start = true;
+        } else if snapshot.state == 3 {
+            self.awaiting_official_start = false;
         }
         self.opponent_number = Some(snapshot.opponent_number);
+        if !self.auto_true_data {
+            self.acquisition_opponent = None;
+        }
         self.received_at = Some(now);
         self.latest = Some(snapshot.clone());
         self.notice = None;

@@ -7,9 +7,14 @@ use tui_textarea::{CursorMove, TextArea};
 
 use crate::{
     capture::{CaptureLog, Packet},
+    discovery::Discovery,
     game_controller::{Receiver, Update, format_clock},
     model::{Entry, EventKind, MatchType, Metadata, Session},
+    navigation::{Command, Keybindings, wrap_selection},
+    presentation::{ACCENT, ERROR, FOCUS},
+    settings::Settings,
     storage::Store,
+    teams::{TEAMS, team_name, team_number},
 };
 
 pub const EVENT_KINDS: [EventKind; 9] = [
@@ -24,7 +29,7 @@ pub const EVENT_KINDS: [EventKind; 9] = [
     EventKind::GoldenGoalStart,
 ];
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     Mark(EventKind),
     Match,
@@ -39,18 +44,20 @@ pub enum Action {
     Undo,
     Redo,
     Quit,
+    OpenLogFolder,
+    ReconnectController,
 }
 
 impl Action {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Mark(EventKind::Note) => "New note (keep unfinished draft)",
+            Self::Mark(EventKind::Note) => "New note",
             Self::Mark(kind) => kind.label(),
             Self::Match => "Edit match details",
             Self::Correct => "Correct selected event",
             Self::Delete => "Remove selected event (reversible)",
             Self::Restore => "Restore removed event",
-            Self::Controller => "Toggle GameController (v20 UDP 3838)",
+            Self::Controller => "Resume GC logging",
             Self::TrueData => "Request true GC data",
             Self::PreviewUp => "Scroll preview up",
             Self::PreviewDown => "Scroll preview down",
@@ -58,32 +65,36 @@ impl Action {
             Self::Undo => "Undo note edit",
             Self::Redo => "Redo note edit",
             Self::Quit => "Save and quit",
+            Self::OpenLogFolder => "Open log folder",
+            Self::ReconnectController => "Reconnect/switch GC (same match)",
         }
     }
 }
 
-pub const ACTIONS: &[(char, Action)] = &[
-    ('g', Action::Mark(EventKind::GameStart)),
-    ('h', Action::Mark(EventKind::HalfTime)),
-    ('s', Action::Mark(EventKind::SecondHalfStart)),
-    ('1', Action::Mark(EventKind::GoalHome)),
-    ('2', Action::Mark(EventKind::GoalAway)),
-    ('f', Action::Mark(EventKind::GameEnd)),
-    ('x', Action::Mark(EventKind::Custom)),
-    ('n', Action::Mark(EventKind::Note)),
-    ('t', Action::Mark(EventKind::GoldenGoalStart)),
-    ('m', Action::Match),
-    ('e', Action::Correct),
-    ('d', Action::Delete),
-    ('b', Action::Restore),
-    ('l', Action::Controller),
-    ('v', Action::TrueData),
-    ('[', Action::PreviewUp),
-    (']', Action::PreviewDown),
-    ('w', Action::RetrySave),
-    ('u', Action::Undo),
-    ('r', Action::Redo),
-    ('q', Action::Quit),
+pub const ACTIONS: &[Action] = &[
+    Action::Mark(EventKind::GameStart),
+    Action::Mark(EventKind::HalfTime),
+    Action::Mark(EventKind::SecondHalfStart),
+    Action::Mark(EventKind::GoalHome),
+    Action::Mark(EventKind::GoalAway),
+    Action::Mark(EventKind::Custom),
+    Action::Mark(EventKind::Note),
+    Action::Mark(EventKind::GoldenGoalStart),
+    Action::Match,
+    Action::Correct,
+    Action::Delete,
+    Action::Restore,
+    Action::Controller,
+    Action::TrueData,
+    Action::ReconnectController,
+    Action::PreviewUp,
+    Action::PreviewDown,
+    Action::RetrySave,
+    Action::Undo,
+    Action::Redo,
+    Action::OpenLogFolder,
+    Action::Mark(EventKind::GameEnd),
+    Action::Quit,
 ];
 
 pub enum Mode {
@@ -96,7 +107,13 @@ pub enum Mode {
         gc_seconds_remaining: Option<i16>,
     },
     Form(Form),
-    Delete(usize),
+    ReconnectController {
+        selected: usize,
+    },
+    Delete {
+        index: usize,
+        selected: usize,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -109,13 +126,28 @@ pub enum FormKind {
 pub struct Field {
     pub label: &'static str,
     pub editor: TextArea<'static>,
+    initial_value: String,
+}
+
+pub struct DetectedTeams {
+    pub teams: [&'static str; 2],
+    pub selected: usize,
 }
 
 pub struct Form {
     pub kind: FormKind,
     pub fields: Vec<Field>,
     pub selected: usize,
+    pub editing: bool,
+    pub discard_selected: Option<usize>,
     pub match_type: Option<MatchType>,
+    pub team_selection: Option<usize>,
+    pub team_filter: String,
+    pub team_searching: bool,
+    pub detected_teams: Option<DetectedTeams>,
+    // Display tracked team first without changing saved GoalHome/GoalAway meaning.
+    tracked_are_home: bool,
+    legacy_teams: bool,
 }
 
 fn editor(text: &str) -> TextArea<'static> {
@@ -129,6 +161,7 @@ impl Field {
         Self {
             label,
             editor: editor(value),
+            initial_value: value.to_owned(),
         }
     }
 
@@ -141,8 +174,8 @@ impl Form {
     fn metadata(kind: FormKind, metadata: &Metadata, output: &str) -> Self {
         let mut fields = vec![
             Field::new("Event / competition", &metadata.event),
-            Field::new("Home team", &metadata.home),
-            Field::new("Away team", &metadata.away),
+            Field::new("Tracked team", metadata.tracked_team_name()),
+            Field::new("Opponent", metadata.opponent_name()),
             Field::new("Date (YYYY-MM-DD)", &metadata.date.to_string()),
             Field::new("Match label / filename", &metadata.label),
         ];
@@ -161,16 +194,21 @@ impl Form {
         let setup = matches!(kind, FormKind::Setup);
         if setup {
             fields.push(Field::new("Output directory", output));
-            fields.push(Field::new(
-                "Match type (←/→ to change)",
-                "Golden Goal + official",
-            ));
+            fields.push(Field::new("Match type", "Golden Goal + official"));
         }
         Self {
             kind,
             fields,
             selected: 0,
+            editing: false,
+            discard_selected: None,
             match_type: setup.then_some(MatchType::Combined),
+            team_selection: None,
+            team_filter: String::new(),
+            team_searching: false,
+            detected_teams: None,
+            tracked_are_home: metadata.tracked_are_home(),
+            legacy_teams: !setup && metadata.tracked_team.is_none(),
         }
     }
 
@@ -178,7 +216,7 @@ impl Form {
         Self {
             kind: FormKind::Entry(index),
             fields: vec![
-                Field::new("Event type (←/→ to change)", entry.kind.label()),
+                Field::new("Event type", entry.kind.label()),
                 Field::new(
                     "Timestamp (RFC3339, explicitly editable)",
                     &entry.timestamp.to_rfc3339(),
@@ -193,29 +231,52 @@ impl Form {
                 ),
             ],
             selected: 2,
+            editing: false,
+            discard_selected: None,
             match_type: None,
+            team_selection: None,
+            team_filter: String::new(),
+            team_searching: false,
+            detected_teams: None,
+            tracked_are_home: true,
+            legacy_teams: false,
         }
     }
 
+    fn changed(&self) -> bool {
+        self.fields
+            .iter()
+            .any(|field| field.value() != field.initial_value)
+    }
+
     pub fn read_metadata(&self) -> Result<Metadata, String> {
+        let tracked = self.fields[1].value().trim();
+        let opponent = self.fields[2].value().trim();
+        let tracked_number = team_number(tracked).ok_or("Choose a known tracked team")?;
+        let opponent_number = team_number(opponent).ok_or("Choose a known opponent")?;
+        if tracked_number == opponent_number {
+            return Err("Tracked team and opponent must be different".into());
+        }
+        let legacy_unchanged = self.legacy_teams
+            && team_number(&self.fields[1].initial_value) == Some(tracked_number)
+            && team_number(&self.fields[2].initial_value) == Some(opponent_number);
+        let (home, away) = if self.tracked_are_home {
+            (tracked, opponent)
+        } else {
+            (opponent, tracked)
+        };
         let metadata = Metadata {
             event: self.fields[0].value().trim().to_owned(),
-            home: self.fields[1].value().trim().to_owned(),
-            away: self.fields[2].value().trim().to_owned(),
+            home: home.to_owned(),
+            away: away.to_owned(),
+            tracked_team: (!legacy_unchanged).then_some(tracked_number),
             date: NaiveDate::parse_from_str(self.fields[3].value(), "%Y-%m-%d")
                 .map_err(|_| "Date must be YYYY-MM-DD".to_owned())?,
             label: self.fields[4].value().trim().to_owned(),
             robots: std::array::from_fn(|i| self.fields[5 + i].value().trim().to_owned()),
         };
         metadata.validate()?;
-        let opponent = if metadata.hulks_are_home() {
-            &metadata.away
-        } else {
-            &metadata.home
-        };
-        if self.match_type == Some(MatchType::GoldenGoal)
-            && !opponent.eq_ignore_ascii_case("Invisibles")
-        {
+        if self.match_type == Some(MatchType::GoldenGoal) && opponent_number != 0 {
             return Err("Golden Goal opponent must be Invisibles; use a new official session for a real match".into());
         }
         Ok(metadata)
@@ -243,21 +304,118 @@ impl Form {
         })
     }
 
-    fn is_choice_field(&self) -> bool {
-        (matches!(self.kind, FormKind::Entry(_)) && self.selected == 0)
+    pub(crate) fn is_team_field(&self) -> bool {
+        !matches!(self.kind, FormKind::Entry(_)) && matches!(self.selected, 1 | 2)
+    }
+
+    pub(crate) fn team_choices(&self) -> &'static [(u8, &'static str)] {
+        if self.selected == 2 && self.match_type == Some(MatchType::GoldenGoal) {
+            &TEAMS[..1]
+        } else {
+            TEAMS
+        }
+    }
+
+    pub(crate) fn visible_teams(&self) -> Vec<usize> {
+        let filter = self.team_filter.to_lowercase();
+        self.team_choices()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (_, name))| name.to_lowercase().contains(&filter).then_some(index))
+            .collect()
+    }
+
+    fn update_team_filter(&mut self) {
+        let visible = self.visible_teams();
+        if !self
+            .team_selection
+            .is_some_and(|index| visible.contains(&index))
+        {
+            self.team_selection = Some(visible.first().copied().unwrap_or(0));
+        }
+    }
+
+    pub(crate) fn is_choice_field(&self) -> bool {
+        self.is_team_field()
+            || (matches!(self.kind, FormKind::Entry(_)) && self.selected == 0)
             || (matches!(self.kind, FormKind::Setup) && self.selected == 11)
     }
 
-    fn key(&mut self, key: KeyEvent) {
-        let controls = self.fields.len() + 1;
-        match key.code {
-            KeyCode::Tab | KeyCode::Down | KeyCode::Enter => {
-                self.selected = (self.selected + 1) % controls
+    fn navigate(&mut self, command: Command) {
+        if let Some(detected) = &mut self.detected_teams {
+            match command {
+                Command::Up | Command::Left | Command::Down | Command::Right => {
+                    detected.selected = wrap_selection(
+                        detected.selected,
+                        3,
+                        matches!(command, Command::Down | Command::Right),
+                    );
+                }
+                Command::Confirm if detected.selected > 0 => {
+                    let tracked = detected.selected - 1;
+                    self.fields[1].editor = editor(detected.teams[tracked]);
+                    self.fields[2].editor = editor(detected.teams[1 - tracked]);
+                    self.match_type = Some(MatchType::Official);
+                    self.fields[11].editor = editor("Official match");
+                    if self.fields[4].value() == "Golden_Goal" {
+                        self.fields[4].editor = editor("1st_game");
+                    }
+                    self.detected_teams = None;
+                }
+                Command::Confirm | Command::Back => self.detected_teams = None,
+                _ => {}
             }
-            KeyCode::BackTab | KeyCode::Up => {
-                self.selected = (self.selected + controls - 1) % controls
+            return;
+        }
+        if let Some(selected) = self.team_selection {
+            let visible = self.visible_teams();
+            match command {
+                Command::Up | Command::Left | Command::Down | Command::Right => {
+                    if let Some(position) = visible.iter().position(|index| *index == selected) {
+                        self.team_selection = Some(
+                            visible[wrap_selection(
+                                position,
+                                visible.len(),
+                                matches!(command, Command::Down | Command::Right),
+                            )],
+                        );
+                    }
+                }
+                Command::Confirm if self.team_searching => self.team_searching = false,
+                Command::Confirm if visible.contains(&selected) => {
+                    self.fields[self.selected].editor = editor(self.team_choices()[selected].1);
+                    self.team_selection = None;
+                    self.team_filter.clear();
+                }
+                Command::Back if self.team_searching || !self.team_filter.is_empty() => {
+                    self.team_searching = false;
+                    self.team_filter.clear();
+                }
+                Command::Back => self.team_selection = None,
+                _ => {}
             }
-            KeyCode::Left | KeyCode::Right
+            return;
+        }
+        let controls = self.fields.len() + 2 + usize::from(matches!(self.kind, FormKind::Setup));
+        match command {
+            Command::Down => self.selected = (self.selected + 1) % controls,
+            Command::Up => self.selected = (self.selected + controls - 1) % controls,
+            Command::Confirm if self.selected < self.fields.len() => {
+                if self.is_team_field() {
+                    let number = team_number(self.fields[self.selected].value());
+                    self.team_selection = Some(
+                        self.team_choices()
+                            .iter()
+                            .position(|(id, _)| Some(*id) == number)
+                            .unwrap_or(0),
+                    );
+                } else if self.is_choice_field() {
+                    self.navigate(Command::Right);
+                } else {
+                    self.editing = true;
+                }
+            }
+            Command::Left | Command::Right
                 if matches!(self.kind, FormKind::Setup) && self.selected == 11 =>
             {
                 let choices = [
@@ -269,7 +427,7 @@ impl Form {
                     .iter()
                     .position(|choice| Some(*choice) == self.match_type)
                     .unwrap_or(0);
-                let step = if key.code == KeyCode::Left {
+                let step = if command == Command::Left {
                     choices.len() - 1
                 } else {
                     1
@@ -282,12 +440,7 @@ impl Form {
                     MatchType::Official => "Official match",
                 });
                 if selected == MatchType::GoldenGoal {
-                    let opponent = if self.fields[2].value().trim().eq_ignore_ascii_case("HULKs") {
-                        1
-                    } else {
-                        2
-                    };
-                    self.fields[opponent].editor = editor("Invisibles");
+                    self.fields[2].editor = editor("Invisibles");
                     if self.fields[4].value() == "1st_game" {
                         self.fields[4].editor = editor("Golden_Goal");
                     }
@@ -295,7 +448,7 @@ impl Form {
                     self.fields[4].editor = editor("1st_game");
                 }
             }
-            KeyCode::Left | KeyCode::Right
+            Command::Left | Command::Right
                 if matches!(self.kind, FormKind::Entry(_)) && self.selected == 0 =>
             {
                 let kinds: Vec<_> = EVENT_KINDS
@@ -306,16 +459,15 @@ impl Form {
                     .iter()
                     .position(|kind| kind.label() == self.fields[0].value())
                     .unwrap_or(0);
-                let step = if key.code == KeyCode::Left {
+                let step = if command == Command::Left {
                     kinds.len() - 1
                 } else {
                     1
                 };
                 self.fields[0].editor = editor(kinds[(current + step) % kinds.len()].label());
             }
-            _ if self.selected < self.fields.len() && !self.is_choice_field() => {
-                edit_key(&mut self.fields[self.selected].editor, key);
-            }
+            Command::Left => self.selected = (self.selected + controls - 1) % controls,
+            Command::Right => self.selected = (self.selected + 1) % controls,
             _ => {}
         }
     }
@@ -325,6 +477,9 @@ pub struct App {
     pub session: Option<Session>,
     pub store: Option<Store>,
     pub mode: Mode,
+    pub keys: Keybindings,
+    pub help_visible: bool,
+    pub controls_visible: bool,
     pub note_editor: TextArea<'static>,
     pub history: ListState,
     pub preview_scroll: Option<u16>,
@@ -333,6 +488,7 @@ pub struct App {
     pub save_error: Option<String>,
     pub dirty: bool,
     pub controller: Option<Receiver>,
+    pub discovery: Discovery,
     pub controller_error: Option<String>,
     pub pending_controller: Vec<Update>,
     pub capture_log: Option<CaptureLog>,
@@ -342,7 +498,12 @@ pub struct App {
 }
 
 impl App {
+    #[cfg(test)]
     pub fn new(path: Option<&Path>) -> io::Result<Self> {
+        Self::new_with_settings(path, &Settings::default())
+    }
+
+    pub fn new_with_settings(path: Option<&Path>, settings: &Settings) -> io::Result<Self> {
         if let Some(path) = path {
             let (store, mut session) = Store::open(path)?;
             let capture_log = if session.capture_session.is_some() {
@@ -357,6 +518,9 @@ impl App {
                 session: Some(session),
                 store: Some(store),
                 mode: Mode::Idle,
+                keys: settings.keys.clone(),
+                help_visible: false,
+                controls_visible: true,
                 note_editor: editor(""),
                 history: ListState::default(),
                 preview_scroll: None,
@@ -365,6 +529,7 @@ impl App {
                 save_error: None,
                 dirty: false,
                 controller: None,
+                discovery: Discovery::default(),
                 controller_error: None,
                 pending_controller: Vec::new(),
                 capture_log,
@@ -381,30 +546,34 @@ impl App {
             return Ok(app);
         }
         let metadata = Metadata {
-            event: String::new(),
-            home: "HULKs".into(),
-            away: String::new(),
+            event: settings.event.clone(),
+            home: settings.home.clone(),
+            away: settings.away.clone(),
+            tracked_team: team_number(&settings.home),
             date: Local::now().date_naive(),
             label: "1st_game".into(),
-            robots: std::array::from_fn(|_| String::new()),
+            robots: settings.robots.clone(),
         };
-        let output = std::env::current_dir()?.join("logs");
         Ok(Self {
             session: None,
             store: None,
             mode: Mode::Form(Form::metadata(
                 FormKind::Setup,
                 &metadata,
-                &output.to_string_lossy(),
+                &settings.log_directory.to_string_lossy(),
             )),
+            keys: settings.keys.clone(),
+            help_visible: false,
+            controls_visible: true,
             note_editor: editor(""),
             history: ListState::default(),
             preview_scroll: None,
             preview_max: 0,
-            status: "Fill match details, then select Create match and press Enter".into(),
+            status: "Select a field, confirm to edit, then select Create match".into(),
             save_error: None,
             dirty: false,
             controller: None,
+            discovery: Discovery::default(),
             controller_error: None,
             pending_controller: Vec::new(),
             capture_log: None,
@@ -414,20 +583,29 @@ impl App {
         })
     }
 
+    pub fn poll_discovery(&mut self) {
+        if self.controller.is_none() {
+            self.discovery.poll();
+        } else {
+            self.discovery = Discovery::default();
+        }
+    }
+
     pub fn mode_style(&self) -> (&'static str, Color) {
         if self.save_error.is_some() {
-            return ("SAVE FAILED — CHANGES IN MEMORY", Color::LightRed);
+            return ("SAVE FAILED — CHANGES IN MEMORY", ERROR);
         }
         match &self.mode {
-            Mode::Idle => ("IDLE — ENTER TO MARK AN EVENT", Color::LightCyan),
-            Mode::Writing => ("WRITING — TIMESTAMP CAPTURED", Color::LightGreen),
-            Mode::Actions { .. } => ("ACTION MENU — TIME CAPTURED", Color::LightMagenta),
+            Mode::Idle => ("IDLE — ENTER TO MARK AN EVENT", ACCENT),
+            Mode::Writing => ("WRITING — TIMESTAMP CAPTURED", FOCUS),
+            Mode::Actions { .. } => ("ACTION MENU — TIME CAPTURED", ACCENT),
             Mode::Form(form) => match form.kind {
-                FormKind::Setup => ("MATCH SETUP — NOT CREATED YET", Color::LightBlue),
-                FormKind::Metadata => ("EDIT MATCH — SELECT APPLY", Color::LightYellow),
-                FormKind::Entry(_) => ("CORRECTION — SELECT APPLY", Color::LightYellow),
+                FormKind::Setup => ("MATCH SETUP — NOT CREATED YET", ACCENT),
+                FormKind::Metadata => ("EDIT MATCH — SELECT SAVE", ACCENT),
+                FormKind::Entry(_) => ("CORRECTION — SELECT SAVE", ACCENT),
             },
-            Mode::Delete(_) => ("REMOVE EVENT — CAN BE RESTORED", Color::LightRed),
+            Mode::Delete { .. } => ("REMOVE EVENT — CAN BE RESTORED", FOCUS),
+            Mode::ReconnectController { .. } => ("RECONNECT GC — SAME MATCH", FOCUS),
         }
     }
 
@@ -441,7 +619,7 @@ impl App {
             if let Err(error) = result {
                 self.dirty = true;
                 self.save_error = Some(format!(
-                    "Raw capture save failed: {error}. Tab, W retries; quitting is blocked."
+                    "Raw capture save failed: {error}. Select Retry saving in Actions; quitting is blocked."
                 ));
                 return;
             }
@@ -459,7 +637,7 @@ impl App {
                 }
                 Err(error) => {
                     self.save_error = Some(format!(
-                        "Save failed: {error}. Tab, W retries; quitting is blocked."
+                        "Save failed: {error}. Select Retry saving in Actions; quitting is blocked."
                     ))
                 }
             }
@@ -505,7 +683,7 @@ impl App {
             .and_then(|controller| controller.latest.as_ref())
             .map_or((None, None), |packet| {
                 (
-                    Some(packet.hulks_message_budget),
+                    Some(packet.tracked_message_budget),
                     Some(packet.seconds_remaining),
                 )
             })
@@ -526,7 +704,7 @@ impl App {
                 && kind == EventKind::GameStart
         });
         if start_official && self.controller.is_some() {
-            self.status = "Waiting for GC opponent change. Stop listening to start the official game manually.".into();
+            self.status = "Waiting for GC official restart / opponent change. Stop listening to start the official game manually.".into();
             self.restore_mode();
             return;
         }
@@ -572,7 +750,8 @@ impl App {
                 .is_some_and(|session| session.match_type.is_some() || !session.in_golden_goal())
         {
             self.status =
-                "GC owns goals while listening. Tab, L stops listening for manual goals.".into();
+                "GC owns goals while logging. Select Pause GC logging in Actions for manual goals."
+                    .into();
             self.restore_mode();
             return;
         }
@@ -630,14 +809,66 @@ impl App {
     }
 
     fn request_quit(&mut self) -> bool {
-        if matches!(&self.mode, Mode::Form(form) if !matches!(form.kind, FormKind::Setup)) {
-            self.status = "Select Apply or cancel the form with Esc before quitting".into();
+        if matches!(&self.mode, Mode::Form(form) if !matches!(form.kind, FormKind::Setup) || form.changed())
+        {
+            self.status = "Select Save or Cancel before quitting".into();
             return false;
         }
         self.poll_controller();
         self.flush_controller();
         self.persist();
         self.save_error.is_none()
+    }
+
+    fn reconnect_controller(&mut self) {
+        self.poll_controller();
+        self.flush_controller();
+        self.persist();
+        if self.save_error.is_some() {
+            self.status = "GC unchanged: retry saving before reconnecting".into();
+            return;
+        }
+        let opponent = self
+            .controller
+            .as_ref()
+            .and_then(Receiver::opponent_number)
+            .or_else(|| {
+                self.session.as_ref().and_then(|session| {
+                    if session.current_game() == MatchType::Official {
+                        session.official_opponent
+                    } else {
+                        session.golden_goal_opponent
+                    }
+                })
+            })
+            .or_else(|| {
+                self.session.as_ref().and_then(|session| {
+                    team_number(if session.current_game() == MatchType::GoldenGoal {
+                        let (home, away) = session.current_teams();
+                        if session.metadata.tracked_are_home() {
+                            away
+                        } else {
+                            home
+                        }
+                    } else {
+                        session.metadata.opponent_name()
+                    })
+                })
+            });
+        match (&mut self.controller, opponent) {
+            (Some(controller), Some(opponent)) => {
+                controller.reconnect(opponent);
+                self.controller_error = None;
+                self.status = format!(
+                    "GC reacquiring {}; history/capture preserved. First matching controller wins; another live matching GC may be selected.",
+                    crate::teams::display_name(opponent)
+                );
+            }
+            (None, _) => self.status = "Resume GC logging first".into(),
+            (_, None) => {
+                self.status = "Cannot safely reconnect: current opponent is unknown".into()
+            }
+        }
     }
 
     fn scroll_preview(&mut self, down: bool) {
@@ -693,9 +924,10 @@ impl App {
             Action::Delete => {
                 if let (Some(session), Some(index)) = (&self.session, self.history.selected()) {
                     if session.entries[index].undone {
-                        self.status = "Event already removed; Tab, B restores it".into();
+                        self.status =
+                            "Event already removed; select Restore removed event in Actions".into();
                     } else {
-                        self.mode = Mode::Delete(index);
+                        self.mode = Mode::Delete { index, selected: 0 };
                     }
                 }
             }
@@ -703,8 +935,7 @@ impl App {
                 if let (Some(session), Some(index)) = (&mut self.session, self.history.selected()) {
                     session.restore(index);
                     self.dirty = true;
-                    self.status =
-                        "Event restored at its original timestamp; score recalculated".into();
+                    self.status = "Event restored.".into();
                 }
             }
             Action::Controller => {
@@ -734,8 +965,31 @@ impl App {
                             }
                         }
                     }
-                    match Receiver::bind() {
+                    let metadata = &self.session.as_ref().unwrap().metadata;
+                    let expected_opponent = metadata
+                        .tracked_team
+                        .and_then(|_| team_number(metadata.opponent_name()));
+                    // Discovery and match logging share UDP 3838; hand off the socket.
+                    self.discovery = Discovery::default();
+                    match Receiver::bind(metadata.tracked_team_number(), expected_opponent) {
                         Ok(mut receiver) => {
+                            let session = self.session.as_ref().unwrap();
+                            receiver.awaiting_official_start = session.match_type
+                                == Some(MatchType::Combined)
+                                && session.current_game() == MatchType::Official
+                                && session.official_opponent.is_some()
+                                && session.official_opponent == session.golden_goal_opponent
+                                && !session.entries.iter().any(|entry| {
+                                    !entry.undone
+                                        && entry.game == Some(MatchType::Official)
+                                        && matches!(
+                                            entry.kind,
+                                            EventKind::GameStart
+                                                | EventKind::HalfTime
+                                                | EventKind::SecondHalfStart
+                                                | EventKind::GameEnd
+                                        )
+                                });
                             receiver.enable_capture(self.capture_log.as_ref().unwrap().next_id());
                             self.controller = Some(receiver);
                             self.status = if self
@@ -754,6 +1008,13 @@ impl App {
                                 Some(format!("Cannot listen on UDP 3838: {error}"));
                         }
                     }
+                }
+            }
+            Action::ReconnectController => {
+                if self.controller.is_some() {
+                    self.mode = Mode::ReconnectController { selected: 0 };
+                } else {
+                    self.status = "Resume GC logging first".into();
                 }
             }
             Action::TrueData => {
@@ -776,7 +1037,7 @@ impl App {
                     }
                 } else {
                     self.status =
-                        "Start GC listening with Tab, L first; wait for a controller, then Tab, V"
+                        "Select Resume GC logging in Actions first; wait for detection, then request true data"
                             .into();
                 }
             }
@@ -797,6 +1058,15 @@ impl App {
                 }
             }
             Action::Quit => return self.request_quit(),
+            Action::OpenLogFolder => {
+                self.status = match &self.store {
+                    Some(store) => match crate::folders::open(store.session_path()) {
+                        Ok(()) => "Opened log folder".into(),
+                        Err(error) => format!("Cannot open log folder: {error}"),
+                    },
+                    None => "Create a saved match before opening its log folder".into(),
+                };
+            }
             Action::PreviewUp | Action::PreviewDown => {
                 self.scroll_preview(matches!(action, Action::PreviewDown));
             }
@@ -805,45 +1075,98 @@ impl App {
     }
 
     pub fn key(&mut self, key: KeyEvent, now: DateTime<FixedOffset>) -> io::Result<bool> {
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            return Ok(false);
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('c') {
             return Ok(self.request_quit());
         }
-        if key.modifiers.contains(KeyModifiers::SHIFT)
+        let text_editing = !self.help_visible
+            && (matches!(self.mode, Mode::Writing)
+                || matches!(&self.mode, Mode::Form(form) if form.editing || form.team_searching));
+        // Printable bindings belong to the editor, including Space and '?'.
+        let literal = matches!(key.code, KeyCode::Char(_))
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let team_field = matches!(&self.mode, Mode::Form(form)
+            if form.is_team_field() && !form.editing && form.discard_selected.is_none());
+        let team_command = if team_field {
+            match key.code {
+                KeyCode::Enter => Some(Command::Confirm),
+                KeyCode::Char(' ') if !text_editing => Some(Command::Confirm),
+                KeyCode::Esc => Some(Command::Back),
+                KeyCode::Up => Some(Command::Up),
+                KeyCode::Down => Some(Command::Down),
+                KeyCode::Left => Some(Command::Left),
+                KeyCode::Right => Some(Command::Right),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let command = if team_command.is_some() {
+            team_command
+        } else if matches!(self.mode, Mode::Idle | Mode::Writing) && key.code == KeyCode::Enter {
+            Some(Command::Confirm)
+        } else if matches!(self.mode, Mode::Idle | Mode::Writing) && key.code == KeyCode::Esc {
+            Some(Command::Back)
+        } else if text_editing && literal {
+            None
+        } else {
+            self.keys.command(key)
+        };
+        if self.help_visible {
+            if matches!(
+                command,
+                Some(Command::Help | Command::Back | Command::Confirm)
+            ) {
+                self.help_visible = false;
+            }
+            return Ok(false);
+        }
+        if command.is_none()
+            && key.modifiers.contains(KeyModifiers::SHIFT)
             && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
         {
             self.scroll_preview(key.code == KeyCode::PageDown);
             return Ok(false);
         }
-        if matches!(self.mode, Mode::Idle | Mode::Writing) {
-            let action = match key.code {
-                KeyCode::Tab | KeyCode::F(2) => {
-                    let (message_budget, gc_seconds_remaining) = self.gc_values();
-                    self.action_capture_after = self.capture_anchor();
-                    self.mode = Mode::Actions {
-                        selected: 0,
-                        timestamp: now,
-                        message_budget,
-                        gc_seconds_remaining,
-                    };
-                    return Ok(false);
-                }
-                KeyCode::F(3) => Some(Action::Match),
-                KeyCode::F(4) => Some(Action::Correct),
-                KeyCode::F(5) => Some(Action::Mark(EventKind::GoalHome)),
-                KeyCode::F(6) => Some(Action::Mark(EventKind::GoalAway)),
-                KeyCode::Char('g') if ctrl => Some(Action::Mark(EventKind::GameStart)),
-                KeyCode::Char('s') if ctrl => Some(Action::RetrySave),
-                _ => None,
+        if command == Some(Command::Help) {
+            self.help_visible = true;
+            return Ok(false);
+        }
+        // Never execute a popup choice while its controls are hidden by the size guard.
+        if !self.controls_visible
+            && command == Some(Command::Confirm)
+            && (matches!(
+                self.mode,
+                Mode::Actions { .. } | Mode::Delete { .. } | Mode::ReconnectController { .. }
+            ) || matches!(&self.mode, Mode::Form(form)
+                    if form.discard_selected.is_some()
+                        || form.team_selection.is_some()
+                        || form.detected_teams.is_some()
+                        || (matches!(form.kind, FormKind::Setup)
+                            && form.selected == form.fields.len() + 2)))
+        {
+            return Ok(false);
+        }
+        if matches!(self.mode, Mode::Idle) && command == Some(Command::Back) {
+            let (message_budget, gc_seconds_remaining) = self.gc_values();
+            self.action_capture_after = self.capture_anchor();
+            self.mode = Mode::Actions {
+                selected: 0,
+                timestamp: now,
+                message_budget,
+                gc_seconds_remaining,
             };
-            if let Some(action) = action {
-                return Ok(self.perform_action(action, now));
-            }
+            return Ok(false);
         }
         let mode = std::mem::replace(&mut self.mode, Mode::Idle);
         match mode {
-            Mode::Idle => match key.code {
-                KeyCode::Enter => {
+            Mode::Idle => match command {
+                Some(Command::Confirm) => {
                     let (message_budget, gc_seconds_remaining) = self.gc_values();
                     self.record(
                         EventKind::Note,
@@ -854,21 +1177,19 @@ impl App {
                     );
                     self.mode = Mode::Writing;
                 }
-                KeyCode::Up => self.move_selection(false),
-                KeyCode::Down => self.move_selection(true),
-                KeyCode::Char('e') => self.open_correction(),
-                KeyCode::Delete | KeyCode::Char('d') => {
-                    self.perform_action(Action::Delete, now);
-                }
+                Some(Command::Up | Command::Left) => self.move_selection(false),
+                Some(Command::Down | Command::Right) => self.move_selection(true),
                 _ => {}
             },
             Mode::Writing => {
-                if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+                if matches!(key.code, KeyCode::Enter | KeyCode::Esc)
+                    || matches!(command, Some(Command::Confirm | Command::Back))
+                {
                     if let Some(session) = &mut self.session {
                         session.submit_note();
                     }
                     self.dirty = true;
-                    self.status = "Note saved. Enter marks the next event.".into();
+                    self.status = "Note saved.".into();
                 } else {
                     self.mode = Mode::Writing;
                     if edit_key(&mut self.note_editor, key) {
@@ -882,33 +1203,20 @@ impl App {
                 message_budget,
                 gc_seconds_remaining,
             } => {
-                let action = match key.code {
-                    KeyCode::Esc | KeyCode::Tab => {
+                let action = match command {
+                    Some(Command::Back) => {
                         self.restore_mode();
                         return Ok(false);
                     }
-                    KeyCode::Up => {
-                        selected = selected.saturating_sub(1);
+                    Some(Command::Up | Command::Left) => {
+                        selected = wrap_selection(selected, ACTIONS.len(), false);
                         None
                     }
-                    KeyCode::Down => {
-                        selected = (selected + 1).min(ACTIONS.len() - 1);
+                    Some(Command::Down | Command::Right) => {
+                        selected = wrap_selection(selected, ACTIONS.len(), true);
                         None
                     }
-                    KeyCode::Enter => Some(ACTIONS[selected].1),
-                    KeyCode::Char(ch)
-                        if !key
-                            .modifiers
-                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                    {
-                        ACTIONS
-                            .iter()
-                            .position(|(shortcut, _)| *shortcut == ch.to_ascii_lowercase())
-                            .map(|index| {
-                                selected = index;
-                                ACTIONS[index].1
-                            })
-                    }
+                    Some(Command::Confirm) => Some(ACTIONS[selected]),
                     _ => None,
                 };
                 self.mode = Mode::Actions {
@@ -921,39 +1229,145 @@ impl App {
                     return Ok(self.perform_action(action, timestamp));
                 }
             }
-            Mode::Form(mut form) => {
-                if key.code == KeyCode::Esc {
-                    if matches!(form.kind, FormKind::Setup) {
-                        return Ok(true);
-                    }
+            Mode::ReconnectController { mut selected } => match command {
+                Some(Command::Back) => self.restore_mode(),
+                Some(Command::Up | Command::Down | Command::Left | Command::Right) => {
+                    selected = wrap_selection(selected, 2, true);
+                    self.mode = Mode::ReconnectController { selected };
+                }
+                Some(Command::Confirm) => {
                     self.restore_mode();
-                    self.status = "Form cancelled; previous data kept".into();
-                } else if (ctrl && key.code == KeyCode::Char('s'))
-                    || (key.code == KeyCode::Enter && form.selected == form.fields.len())
+                    if selected == 1 {
+                        self.reconnect_controller();
+                    }
+                }
+                _ => self.mode = Mode::ReconnectController { selected },
+            },
+            Mode::Form(mut form) => {
+                if let Some(detected) = &form.detected_teams {
+                    let apply = command == Some(Command::Confirm) && detected.selected > 0;
+                    if let Some(command) = command {
+                        form.navigate(command);
+                    }
+                    if form.detected_teams.is_none() {
+                        self.status = if apply {
+                            "Detected teams applied to draft as Official match; review before Create match"
+                        } else {
+                            "Detected team selection cancelled; setup unchanged"
+                        }.into();
+                    }
+                    self.mode = Mode::Form(form);
+                } else if form.team_selection.is_some() {
+                    if form.team_searching && literal {
+                        if let KeyCode::Char(ch) = key.code {
+                            form.team_filter.push(ch);
+                            form.update_team_filter();
+                        }
+                    } else if form.team_searching && key.code == KeyCode::Backspace {
+                        form.team_filter.pop();
+                        form.update_team_filter();
+                    } else if key.code == KeyCode::Char('/') && literal && command.is_none() {
+                        form.team_searching = true;
+                    } else if let Some(command) = command {
+                        form.navigate(command);
+                    }
+                    self.mode = Mode::Form(form);
+                } else if let Some(selected) = form.discard_selected {
+                    match command {
+                        _ if key.code == KeyCode::Esc => form.discard_selected = None,
+                        Some(Command::Back) => form.discard_selected = None,
+                        Some(Command::Confirm) if selected == 1 => {
+                            if matches!(form.kind, FormKind::Setup) {
+                                return Ok(true);
+                            }
+                            self.restore_mode();
+                            self.status = "Form cancelled; previous data kept".into();
+                            return Ok(false);
+                        }
+                        Some(Command::Confirm) => form.discard_selected = None,
+                        Some(Command::Up | Command::Left | Command::Down | Command::Right) => {
+                            form.discard_selected =
+                                Some(wrap_selection(form.discard_selected.unwrap_or(0), 2, true));
+                        }
+                        _ => {}
+                    }
+                    self.mode = Mode::Form(form);
+                } else if form.editing {
+                    if matches!(key.code, KeyCode::Enter | KeyCode::Esc)
+                        || matches!(command, Some(Command::Confirm | Command::Back))
+                    {
+                        form.editing = false;
+                    } else {
+                        edit_key(&mut form.fields[form.selected].editor, key);
+                    }
+                    self.mode = Mode::Form(form);
+                } else if command == Some(Command::Back)
+                    || key.code == KeyCode::Esc
+                    || (command == Some(Command::Confirm) && form.selected == form.fields.len() + 1)
                 {
+                    if form.changed() {
+                        form.discard_selected = Some(0);
+                        self.mode = Mode::Form(form);
+                    } else if matches!(form.kind, FormKind::Setup) {
+                        return Ok(true);
+                    } else {
+                        self.restore_mode();
+                        self.status = "Form cancelled; previous data kept".into();
+                    }
+                } else if matches!(form.kind, FormKind::Setup)
+                    && command == Some(Command::Confirm)
+                    && form.selected == form.fields.len() + 2
+                {
+                    let teams = self
+                        .discovery
+                        .detected_teams()
+                        .and_then(|(first, second)| Some([team_name(first)?, team_name(second)?]));
+                    if let Some(teams) = teams {
+                        form.detected_teams = Some(DetectedTeams { teams, selected: 0 });
+                        self.status = "Choose the tracked team to set both draft teams and use Official match type; Cancel keeps the draft".into();
+                    } else {
+                        self.status = "No fresh supported GC teams detected; fill in the setup manually or try again".into();
+                    }
+                    self.mode = Mode::Form(form);
+                } else if command == Some(Command::Confirm) && form.selected == form.fields.len() {
                     if let Err(error) = self.apply_form(&form) {
                         self.status = error;
                         self.mode = Mode::Form(form);
                     }
                 } else {
-                    form.key(key);
+                    if let Some(command) = command {
+                        form.navigate(command);
+                    }
                     self.mode = Mode::Form(form);
                 }
             }
-            Mode::Delete(index) => match key.code {
-                KeyCode::Char('y') => {
-                    let was_finished = self.session.as_ref().is_some_and(Session::is_finished);
-                    if let Some(session) = &mut self.session {
-                        session.delete(index);
+            Mode::Delete {
+                index,
+                mut selected,
+            } => match command {
+                Some(Command::Back) => self.restore_mode(),
+                Some(Command::Confirm) => {
+                    if selected == 1 {
+                        let was_finished = self.session.as_ref().is_some_and(Session::is_finished);
+                        if let Some(session) = &mut self.session {
+                            session.delete(index);
+                        }
+                        self.history.select(Some(index));
+                        self.dirty = true;
+                        self.status = "Event removed, not erased. Restore it from Actions.".into();
+                        self.rebaseline_if_reopened(was_finished);
                     }
-                    self.history.select(Some(index));
-                    self.dirty = true;
-                    self.status = "Event removed, not erased. Tab, B restores it.".into();
-                    self.rebaseline_if_reopened(was_finished);
                     self.restore_mode();
                 }
-                KeyCode::Esc | KeyCode::Char('n') => self.restore_mode(),
-                _ => self.mode = Mode::Delete(index),
+                _ => {
+                    match command {
+                        Some(Command::Up | Command::Left | Command::Down | Command::Right) => {
+                            selected = wrap_selection(selected, 2, true);
+                        }
+                        _ => {}
+                    }
+                    self.mode = Mode::Delete { index, selected };
+                }
             },
         }
         Ok(false)
@@ -965,7 +1379,7 @@ impl App {
             form.match_type = session.entries[index].game.or(session.match_type);
             self.mode = Mode::Form(form);
             self.status =
-                "Edit description, wall-clock timestamp, GC countdown or event type. Select Apply; Esc cancels.".into();
+                "Select a field and confirm to edit; select Save to apply, or Cancel to keep previous data.".into();
         }
     }
 
@@ -986,6 +1400,7 @@ impl App {
 
     fn apply_form(&mut self, form: &Form) -> Result<(), String> {
         let was_finished = self.session.as_ref().is_some_and(Session::is_finished);
+        let mut controller_stopped = false;
         match form.kind {
             FormKind::Setup => {
                 let metadata = form.read_metadata()?;
@@ -995,18 +1410,41 @@ impl App {
                 }
                 let session =
                     Session::new_match(metadata, form.match_type.ok_or("Choose a match type")?);
+                session.validate()?;
                 let store = Store::create(Path::new(output), &session)
                     .map_err(|error| format!("Cannot create log: {error}"))?;
                 self.store = Some(store);
                 self.session = Some(session);
             }
             FormKind::Metadata => {
+                self.flush_controller();
                 let metadata = form.read_metadata()?;
                 if let Some(session) = &mut self.session {
-                    session.metadata = metadata;
-                    if let Some(controller) = &mut self.controller {
+                    let tracked_changed =
+                        session.metadata.tracked_team_number() != metadata.tracked_team_number();
+                    if tracked_changed
+                        && (!self.pending_controller.is_empty()
+                            || self.last_capture_id.is_some_and(|id| id > 0)
+                            || !self.pending_capture.is_empty()
+                            || session.entries.iter().any(|entry| {
+                                entry.has_controller_snapshot() || entry.statistics.is_some()
+                            }))
+                    {
+                        return Err("Cannot change the tracked team after GC history has been captured; create a new match".into());
+                    }
+                    let teams_changed = tracked_changed
+                        || team_number(session.metadata.opponent_name())
+                            != team_number(metadata.opponent_name());
+                    let mut candidate = session.clone();
+                    candidate.metadata = metadata;
+                    candidate.validate()?;
+                    if teams_changed {
+                        controller_stopped = self.controller.take().is_some();
+                        self.controller_error = None;
+                    } else if let Some(controller) = &mut self.controller {
                         controller.rebaseline();
                     }
+                    *session = candidate;
                 }
                 self.dirty = true;
             }
@@ -1025,7 +1463,12 @@ impl App {
             }
         }
         self.rebaseline_if_reopened(was_finished);
-        self.status = "Changes applied".into();
+        self.status = if controller_stopped {
+            "Changes applied; GC stopped after team change. Enable it again from Actions."
+        } else {
+            "Changes applied"
+        }
+        .into();
         self.restore_mode();
         Ok(())
     }
@@ -1040,6 +1483,9 @@ impl App {
     }
 
     pub fn paste(&mut self, text: &str) {
+        if self.help_visible {
+            return;
+        }
         let text: String = text
             .chars()
             .map(|ch| if ch.is_control() { ' ' } else { ch })
@@ -1049,7 +1495,9 @@ impl App {
                 self.note_editor.insert_str(text);
                 self.sync_note();
             }
-            Mode::Form(form) if form.selected < form.fields.len() && !form.is_choice_field() => {
+            Mode::Form(form)
+                if form.editing && form.selected < form.fields.len() && !form.is_choice_field() =>
+            {
                 form.fields[form.selected].editor.insert_str(text);
             }
             _ => {}

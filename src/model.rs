@@ -9,18 +9,41 @@ pub struct Metadata {
     pub event: String,
     pub home: String,
     pub away: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracked_team: Option<u8>,
     pub date: NaiveDate,
     pub label: String,
     pub robots: [String; 5],
 }
 
 impl Metadata {
-    pub fn hulks_are_home(&self) -> bool {
-        self.home.trim().eq_ignore_ascii_case("HULKs")
+    pub fn tracked_team_number(&self) -> u8 {
+        self.tracked_team
+            .unwrap_or(crate::game_controller::HULKS_TEAM_NUMBER)
+    }
+
+    pub fn tracked_are_home(&self) -> bool {
+        crate::teams::team_number(&self.home) == Some(self.tracked_team_number())
+    }
+
+    pub fn tracked_team_name(&self) -> &str {
+        if self.tracked_are_home() {
+            &self.home
+        } else {
+            &self.away
+        }
+    }
+
+    pub fn opponent_name(&self) -> &str {
+        if self.tracked_are_home() {
+            &self.away
+        } else {
+            &self.home
+        }
     }
 
     pub fn golden_goal_teams(&self) -> (&str, &str) {
-        if self.hulks_are_home() {
+        if self.tracked_are_home() {
             (&self.home, "Invisibles")
         } else {
             ("Invisibles", &self.away)
@@ -39,7 +62,21 @@ impl Metadata {
             }
             validate_text(name, value, false)?;
         }
-        if self.hulks_are_home() == self.away.trim().eq_ignore_ascii_case("HULKs") {
+        if let Some(tracked) = self.tracked_team {
+            let home =
+                crate::teams::team_number(&self.home).ok_or("Choose a supported home team")?;
+            let away =
+                crate::teams::team_number(&self.away).ok_or("Choose a supported away team")?;
+            if home == away {
+                return Err("Tracked team and opponent must be different".into());
+            }
+            if tracked != home && tracked != away {
+                return Err("Tracked team must be one of the match teams".into());
+            }
+        } else if self.home.trim().eq_ignore_ascii_case("HULKs")
+            == self.away.trim().eq_ignore_ascii_case("HULKs")
+        {
+            // Logs without an explicit perspective retain the original HULKs semantics.
             return Err("Exactly one team must be HULKs (home or away)".into());
         }
         for robot in &self.robots {
@@ -85,9 +122,21 @@ impl EventKind {
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PostgameNote {
+    pub actionable: bool,
+    pub title: String,
+    pub robots: String,
+    pub owner: String,
+    pub discussion: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Entry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postgame: Option<PostgameNote>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -116,7 +165,7 @@ pub struct Entry {
 }
 
 impl Entry {
-    fn has_controller_snapshot(&self) -> bool {
+    pub(crate) fn has_controller_snapshot(&self) -> bool {
         if !self.from_controller
             || self.kind == EventKind::Note
             || !(self.text.starts_with("GC received: ")
@@ -140,6 +189,42 @@ impl Entry {
             && seconds.parse::<u8>().is_ok_and(|seconds| seconds < 60)
     }
 
+    pub(crate) fn display_text(&self) -> String {
+        if !self.has_controller_snapshot() {
+            return self.text.clone();
+        }
+        let score = self
+            .text
+            .strip_prefix("GC received: ")
+            .or_else(|| self.text.strip_prefix("GC sync — received: "))
+            .unwrap_or(&self.text)
+            .split(';')
+            .next()
+            .unwrap_or_default();
+        let penalties = self
+            .statistics
+            .as_ref()
+            .map(|stats| stats.penalties.as_slice())
+            .unwrap_or_default();
+        if !penalties.is_empty() {
+            format!(
+                "Penalties · {}",
+                penalties
+                    .iter()
+                    .map(|change| format!(
+                        "player {}: {}→{}",
+                        change.player, change.before, change.after
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        } else if self.kind == EventKind::Custom {
+            format!("Score sync · {score}")
+        } else {
+            format!("{} · {score}", self.kind.label())
+        }
+    }
+
     pub(crate) fn ends_golden_goal(&self) -> bool {
         matches!(self.kind, EventKind::GameStart | EventKind::SecondHalfStart)
             || (self.from_controller
@@ -157,8 +242,12 @@ pub struct Session {
     pub match_type: Option<MatchType>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub golden_goal_opponent: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub official_opponent: Option<u8>,
     pub entries: Vec<Entry>,
     pub active_note: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postgame_position: Option<usize>,
 }
 
 impl Session {
@@ -168,8 +257,10 @@ impl Session {
             metadata,
             match_type: None,
             golden_goal_opponent: None,
+            official_opponent: None,
             entries: Vec::new(),
             active_note: None,
+            postgame_position: None,
         }
     }
 
@@ -230,6 +321,7 @@ impl Session {
 
     pub fn record(&mut self, kind: EventKind, now: DateTime<FixedOffset>) {
         self.entries.push(Entry {
+            postgame: None,
             capture_id: None,
             capture_after: None,
             game: (self.match_type == Some(MatchType::Combined)).then(|| self.current_game()),
@@ -383,15 +475,24 @@ impl Session {
 
     pub fn validate(&self) -> Result<(), String> {
         self.metadata.validate()?;
+        if matches!(
+            self.match_type,
+            Some(MatchType::GoldenGoal | MatchType::Combined)
+        ) && self.metadata.tracked_team_number() == 0
+        {
+            return Err("Invisibles cannot be the tracked team in Golden Goal".into());
+        }
         if self.match_type == Some(MatchType::GoldenGoal) {
-            let opponent = if self.metadata.hulks_are_home() {
-                &self.metadata.away
-            } else {
-                &self.metadata.home
-            };
+            let opponent = self.metadata.opponent_name();
             if !opponent.trim().eq_ignore_ascii_case("Invisibles") {
                 return Err("Golden Goal opponent must be Invisibles".into());
             }
+        }
+        if self
+            .postgame_position
+            .is_some_and(|index| index >= self.entries.len())
+        {
+            return Err("Postgame position must refer to an existing entry".into());
         }
         if let Some(index) = self.active_note {
             match self.entries.get(index) {
@@ -401,6 +502,16 @@ impl Session {
         }
         for entry in &self.entries {
             validate_text("Entry text", &entry.text, true)?;
+            if let Some(note) = &entry.postgame {
+                for (name, value) in [
+                    ("Issue title", &note.title),
+                    ("Robots", &note.robots),
+                    ("Owner", &note.owner),
+                    ("Discussion", &note.discussion),
+                ] {
+                    validate_text(name, value, true)?;
+                }
+            }
             if entry.game == Some(MatchType::Combined)
                 || (self.match_type == Some(MatchType::Combined) && entry.game.is_none())
             {
@@ -512,7 +623,10 @@ impl Session {
                     output.push_str(&format!(
                         "\nGolden Goal score: {test_home} {test_home_score}:{test_away_score} {test_away}\n\n"
                     ));
-                    output.push_str(&message_budget_summary(entry.golden_goal_message_budget));
+                    output.push_str(&message_budget_summary(
+                        entry.golden_goal_message_budget,
+                        self.metadata.tracked_team_name(),
+                    ));
                     in_golden_goal = false;
                 }
                 _ => {}
@@ -633,7 +747,10 @@ impl Session {
                 output.push_str(&format!(
                     "\n{summary}: {home} {summary_home}:{summary_away} {away}\n\n"
                 ));
-                output.push_str(&message_budget_summary(entry.message_budget));
+                output.push_str(&message_budget_summary(
+                    entry.message_budget,
+                    self.metadata.tracked_team_name(),
+                ));
             }
         }
         if !fixed_golden_goal && let Some(summary) = crate::statistics::markdown(self) {
@@ -653,9 +770,10 @@ impl Session {
     }
 }
 
-fn message_budget_summary(budget: Option<u16>) -> String {
+fn message_budget_summary(budget: Option<u16>, team: &str) -> String {
     format!(
-        "HULKs remaining message budget: {}\n\n",
+        "{} remaining message budget: {}\n\n",
+        markdown_text(team),
         budget.map_or_else(
             || "unavailable (no fresh GC reading)".into(),
             |value| value.to_string()

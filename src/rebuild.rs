@@ -78,6 +78,7 @@ pub fn rebuild(session: &mut Session, packets: &[Packet]) -> Result<usize, Strin
             candidate.entries.insert(
                 index,
                 Entry {
+                    postgame: None,
                     game: (session.match_type == Some(MatchType::Combined))
                         .then_some(MatchType::Official),
                     timestamp: packet.received_at,
@@ -86,7 +87,7 @@ pub fn rebuild(session: &mut Session, packets: &[Packet]) -> Result<usize, Strin
                     text: format!("GC received: statistics backfill; {}", snapshot.summary()),
                     undone: false,
                     from_controller: true,
-                    message_budget: Some(snapshot.hulks_message_budget),
+                    message_budget: Some(snapshot.tracked_message_budget),
                     golden_goal_message_budget: None,
                     score_delta: None,
                     statistics: Some(statistics),
@@ -94,10 +95,12 @@ pub fn rebuild(session: &mut Session, packets: &[Packet]) -> Result<usize, Strin
                     capture_after: None,
                 },
             );
-            if let Some(active) = &mut candidate.active_note
-                && *active >= index
-            {
-                *active += 1;
+            for position in [&mut candidate.active_note, &mut candidate.postgame_position] {
+                if let Some(position) = position
+                    && *position >= index
+                {
+                    *position += 1;
+                }
             }
             changed += 1;
         }
@@ -125,14 +128,19 @@ fn validate(session: &Session, packets: &[Packet]) -> Result<Vec<Option<Snapshot
         }
         let snapshot = if packet.accepted {
             Some(
-                decode_capture(&packet.packet, packet.true_data)
-                    .map_err(|error| format!("Capture packet {}: {error}", packet.id))?
-                    .ok_or_else(|| {
-                        format!(
-                            "Accepted capture packet {} is not a selected HULKs packet",
-                            packet.id
-                        )
-                    })?,
+                decode_capture(
+                    &packet.packet,
+                    packet.true_data,
+                    session.metadata.tracked_team_number(),
+                )
+                .map_err(|error| format!("Capture packet {}: {error}", packet.id))?
+                .ok_or_else(|| {
+                    format!(
+                        "Accepted capture packet {} does not contain tracked team #{}",
+                        packet.id,
+                        session.metadata.tracked_team_number()
+                    )
+                })?,
             )
         } else {
             None
@@ -261,13 +269,13 @@ fn insertion_index(session: &Session, id: u64) -> usize {
 
 fn history_changed(before: &Snapshot, after: &Snapshot) -> bool {
     (
-        before.hulks_score,
+        before.tracked_score,
         before.opponent_score,
         before.game_phase,
         before.state,
         before.first_half,
     ) != (
-        after.hulks_score,
+        after.tracked_score,
         after.opponent_score,
         after.game_phase,
         after.state,
@@ -278,7 +286,7 @@ fn history_changed(before: &Snapshot, after: &Snapshot) -> bool {
 fn baseline(snapshot: &Snapshot, pre_game: bool) -> Statistics {
     Statistics {
         baseline: Some(StatisticsBaseline {
-            penalties: snapshot.hulks_penalties,
+            penalties: snapshot.tracked_penalties,
             pre_game,
         }),
         penalties: Vec::new(),
@@ -293,16 +301,16 @@ fn derive(snapshot: &Snapshot, previous: Option<&Snapshot>) -> Statistics {
             snapshot.game_phase == 0
                 && snapshot.first_half
                 && snapshot.state == 0
-                && snapshot.hulks_score == 0
+                && snapshot.tracked_score == 0
                 && snapshot.opponent_score == 0,
         );
     };
     Statistics {
         baseline: None,
         penalties: previous
-            .hulks_penalties
+            .tracked_penalties
             .iter()
-            .zip(snapshot.hulks_penalties)
+            .zip(snapshot.tracked_penalties)
             .enumerate()
             .filter_map(|(index, (&before, after))| {
                 (before != after).then_some(PenaltyChange {
