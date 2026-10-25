@@ -6,7 +6,7 @@
 
 Rust · Ratatui · Match logging · Field visualization · Replay
 
-![GOAL! banner using the logger's arcade font](docs/assets/goal-banner.svg)
+![Actual GOAL! ticker captured from the logger's banner renderer](docs/assets/goal-banner.png)
 
 [Get started](#get-started) · [User guide](docs/guide.md) · [Data & networking](docs/guide.md#data--networking)
 
@@ -51,6 +51,18 @@ Choose **New match**, or **New match from GC** to select your tracked team from 
 Navigation bindings are configurable. Editors accept literal text; Tab is unused.
 
 **Next:** the [short user guide](docs/guide.md) covers replay controls, saved files, recovery, and GitHub handoff.
+
+## GameController reference
+
+This logger integrates with the [RoboCup Humanoid Soccer League GameController](https://github.com/RoboCup-HumanoidSoccerLeague/GameController). Its network integration was developed against the **v7.0.0-rc.3** protocol: match broadcasts, true-data monitor replies, and forwarded robot status messages.
+
+Credit for the GameController and its protocols belongs to its upstream contributors. This logger is a separate project, not an official GameController component; compatibility with other versions or variants is not guaranteed.
+
+## AI development disclosure
+
+This project was developed extensively with AI assistance, including code, refactoring, documentation, and artwork. AI-generated work can contain mistakes, and verification is not a guarantee of correctness. Review the code and validate it in your environment before relying on it during a match; keep backups of important logs.
+
+AI assistance was used during development—not as a runtime requirement. The logger does not call an AI service to process your match data.
 
 ```text
             .-========-.
