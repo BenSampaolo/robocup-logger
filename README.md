@@ -64,18 +64,4 @@ This project was developed extensively with AI assistance, including code, refac
 
 AI assistance was used during development—not as a runtime requirement. The logger does not call an AI service to process your match data.
 
-```text
-            .-========-.
-         .-'    /\      '-.
-        /   ___/  \___     \
-       /   /   \  /   \     \
-      |   |     \/     |     |
-      |    \    /\    /      |
-      |     '---  ---'       |
-       \    /        \     /
-        \   \________/    /
-         '-.          .-'
-            '-======-'
-```
-
 <div align="center"><sub>Keep your eyes on the game. Keep the details in the log.</sub></div>
