@@ -4,7 +4,7 @@ use crate::{
     capture::Packet,
     game_controller::{Snapshot, decode_capture},
     model::{Entry, EventKind, MatchType, Session},
-    statistics::{PenaltyChange, Statistics, StatisticsBaseline},
+    statistics::Statistics,
 };
 
 pub fn rebuild(session: &mut Session, packets: &[Packet]) -> Result<usize, String> {
@@ -50,9 +50,10 @@ pub fn rebuild(session: &mut Session, packets: &[Packet]) -> Result<usize, Strin
         });
         let missing_history = existing.is_none()
             && previous.is_some_and(|(_, before)| history_changed(before, snapshot));
-        let mut statistics = derive(snapshot, continuous.map(|(_, snapshot)| snapshot));
+        let mut statistics =
+            Statistics::from_snapshots(snapshot, continuous.map(|(_, snapshot)| snapshot));
         if missing_history {
-            statistics = baseline(snapshot, false);
+            statistics = Statistics::baseline(snapshot, false);
         }
         previous = Some((packet, snapshot));
 
@@ -83,6 +84,7 @@ pub fn rebuild(session: &mut Session, packets: &[Packet]) -> Result<usize, Strin
                     text: format!("GC received: statistics backfill; {}", snapshot.summary()),
                     undone: false,
                     from_controller: true,
+                    controller_description_edited: false,
                     message_budget: Some(snapshot.tracked_message_budget),
                     golden_goal_message_budget: None,
                     score_delta: None,
@@ -274,49 +276,4 @@ fn history_changed(before: &Snapshot, after: &Snapshot) -> bool {
         after.state,
         after.first_half,
     )
-}
-
-fn baseline(snapshot: &Snapshot, pre_game: bool) -> Statistics {
-    Statistics {
-        baseline: Some(StatisticsBaseline {
-            penalties: snapshot.tracked_penalties,
-            pre_game,
-        }),
-        penalties: Vec::new(),
-        opponent_restart: false,
-    }
-}
-
-fn derive(snapshot: &Snapshot, previous: Option<&Snapshot>) -> Statistics {
-    let Some(previous) = previous else {
-        return baseline(
-            snapshot,
-            snapshot.game_phase == 0
-                && snapshot.first_half
-                && snapshot.state == 0
-                && snapshot.tracked_score == 0
-                && snapshot.opponent_score == 0,
-        );
-    };
-    Statistics {
-        baseline: None,
-        penalties: previous
-            .tracked_penalties
-            .iter()
-            .zip(snapshot.tracked_penalties)
-            .enumerate()
-            .filter_map(|(index, (&before, after))| {
-                (before != after).then_some(PenaltyChange {
-                    player: index as u8 + 1,
-                    before,
-                    after,
-                })
-            })
-            .collect(),
-        opponent_restart: matches!(snapshot.game_phase, 0 | 2)
-            && matches!(snapshot.set_play, 4 | 5)
-            && snapshot.kicking_team == snapshot.opponent_number
-            && (previous.set_play, previous.kicking_team)
-                != (snapshot.set_play, snapshot.kicking_team),
-    }
 }

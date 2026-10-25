@@ -142,7 +142,9 @@ impl Postgame {
     }
 
     fn sync_replay(&mut self, previous: Option<usize>, store: &Store) {
-        let Some(replay) = &self.replay else { return };
+        let Some(replay) = &self.replay else {
+            return;
+        };
         let (current, time, paused) = (replay.current_entry(), replay.time, replay.paused);
         if current != previous {
             if let Some(index) = current {
@@ -212,12 +214,12 @@ impl Postgame {
                 !entry.undone
                     && (self.replay.is_some() || self.entries.binary_search(index).is_ok())
             })
-            .filter_map(|(_, entry)| {
+            .filter_map(|(index, entry)| {
                 entry
                     .postgame
                     .as_ref()
                     .filter(|note| note.actionable)
-                    .map(|note| issue_url(&self.session, entry, note))
+                    .map(|note| issue_url(&self.session, index, entry, note))
             })
             .collect()
     }
@@ -504,7 +506,7 @@ impl Postgame {
         }
         if self.replay.is_some() {
             let previous = self.current_index();
-            if self.replay.as_mut().unwrap().key(key, &self.session) {
+            if self.replay.as_mut().unwrap().key(key) {
                 self.sync_replay(previous, store);
                 return None;
             }
@@ -527,7 +529,7 @@ impl Postgame {
                         self.replay
                             .as_mut()
                             .unwrap()
-                            .key(KeyEvent::new(code, KeyModifiers::NONE), &self.session);
+                            .key(KeyEvent::new(code, KeyModifiers::NONE));
                         self.sync_replay(previous, store);
                     }
                     Some(Command::Confirm | Command::Back) => self.open_menu(Menu::Actions),
@@ -558,7 +560,13 @@ impl Postgame {
         if let Some(jump) = &mut self.jump {
             jump.query.insert_str(
                 text.chars()
-                    .map(|ch| if ch.is_control() { ' ' } else { ch })
+                    .map(|ch| {
+                        if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') {
+                            ' '
+                        } else {
+                            ch
+                        }
+                    })
                     .collect::<String>(),
             );
             jump.selected = 0;
@@ -566,7 +574,7 @@ impl Postgame {
             let text: String = text
                 .chars()
                 .map(|ch| {
-                    if ch.is_control() && ch != '\n' {
+                    if (ch.is_control() && ch != '\n') || matches!(ch, '\u{2028}' | '\u{2029}') {
                         ' '
                     } else {
                         ch
@@ -632,13 +640,18 @@ impl Postgame {
                 rows[0],
             );
         } else {
+            let (home, away) =
+                self.session
+                    .teams_for(if self.session.match_type == Some(MatchType::GoldenGoal) {
+                        MatchType::GoldenGoal
+                    } else {
+                        MatchType::Official
+                    });
             frame.render_widget(
                 Paragraph::new(vec![
                     Line::styled(
                         format!(
-                            "POSTGAME — {} vs {} — {}",
-                            self.session.metadata.home,
-                            self.session.metadata.away,
+                            "POSTGAME — {home} vs {away} — {}",
                             self.session.metadata.label,
                         ),
                         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -1139,8 +1152,8 @@ fn presentation_phase(session: &Session, index: usize) -> Option<&'static str> {
         if game != MatchType::Official {
             continue;
         }
-        phase = if entry.from_controller && entry.kind != EventKind::Note {
-            controller_phase(&entry.text)
+        phase = if entry.has_controller_snapshot() {
+            entry.controller_phase()
         } else {
             match entry.kind {
                 EventKind::GameStart => Some("first half"),
@@ -1152,31 +1165,6 @@ fn presentation_phase(session: &Session, index: usize) -> Option<&'static str> {
         };
     }
     phase
-}
-
-fn controller_phase(text: &str) -> Option<&'static str> {
-    let text = text
-        .strip_prefix("GC received: ")
-        .or_else(|| text.strip_prefix("GC sync — received: "))?;
-    let summary = text.split_once("; set play: ")?.0.rsplit_once("; ")?.1;
-    let (phase, rest) = summary.split_once(" / ")?;
-    let (state, half) = rest.split_once(" / ")?;
-    if !matches!(state, "Initial" | "Ready" | "Set" | "Playing" | "Finished")
-        || !matches!(half, "first half" | "second half")
-    {
-        return None;
-    }
-    match (phase, state, half) {
-        ("Normal", "Finished", "first half") => Some("half-time"),
-        ("Normal", "Finished", "second half") => Some("full-time"),
-        ("Normal", _, "first half") => Some("first half"),
-        ("Normal", _, "second half") => Some("second half"),
-        ("Extra time", _, "first half") => Some("extra time · first half"),
-        ("Extra time", _, "second half") => Some("extra time · second half"),
-        ("Penalty shootout", _, _) => Some("penalty shootout"),
-        ("Timeout", _, _) => Some("timeout"),
-        _ => None,
-    }
 }
 
 fn clock(entry: &Entry) -> String {
@@ -1211,16 +1199,9 @@ fn game_label(game: Option<MatchType>) -> &'static str {
     }
 }
 
-fn issue_url(session: &Session, entry: &Entry, note: &PostgameNote) -> String {
+fn issue_url(session: &Session, index: usize, entry: &Entry, note: &PostgameNote) -> String {
     let game = entry.game.or(session.match_type);
-    let (home, away) = if game == Some(MatchType::GoldenGoal) {
-        session.metadata.golden_goal_teams()
-    } else {
-        (
-            session.metadata.home.as_str(),
-            session.metadata.away.as_str(),
-        )
-    };
+    let (home, away) = session.teams_for(entry_game(session, index));
     let assignments = session
         .metadata
         .robots
@@ -1252,6 +1233,39 @@ fn issue_url(session: &Session, entry: &Entry, note: &PostgameNote) -> String {
         encode_query(&title),
         encode_query(&body)
     )
+}
+
+fn entry_game(session: &Session, index: usize) -> MatchType {
+    if let Some(game) = session.entries[index].game {
+        return game;
+    }
+    if let Some(game) = session.match_type {
+        return if game == MatchType::Combined {
+            MatchType::Official
+        } else {
+            game
+        };
+    }
+    let mut game = MatchType::Official;
+    for entry in session.entries[..=index]
+        .iter()
+        .filter(|entry| !entry.undone)
+    {
+        match entry.kind {
+            EventKind::GoldenGoalStart => game = MatchType::GoldenGoal,
+            _ if entry.ends_golden_goal() => game = MatchType::Official,
+            _ => {}
+        }
+    }
+    let entry = &session.entries[index];
+    if game == MatchType::GoldenGoal
+        && entry.from_controller
+        && entry.kind != EventKind::GoldenGoalStart
+    {
+        MatchType::Official
+    } else {
+        game
+    }
 }
 
 fn encode_query(value: &str) -> String {

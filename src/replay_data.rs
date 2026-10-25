@@ -31,6 +31,7 @@ pub(crate) struct Timeline {
 
 pub struct ControllerSample {
     pub time: f64,
+    pub clock_started: f64,
     pub snapshot: Snapshot,
     pub continuous: bool,
     pub source: IpAddr,
@@ -268,8 +269,22 @@ impl Timeline {
                 epoch,
             });
             if sample.active {
+                let clock_started = timeline
+                    .controllers
+                    .last()
+                    .filter(|previous| {
+                        continuous
+                            && previous.snapshot.seconds_remaining
+                                == sample.snapshot.seconds_remaining
+                            && previous.snapshot.state == sample.snapshot.state
+                            && previous.snapshot.stopped == sample.snapshot.stopped
+                            && previous.snapshot.game_phase == sample.snapshot.game_phase
+                            && previous.snapshot.first_half == sample.snapshot.first_half
+                    })
+                    .map_or(time, |previous| previous.clock_started);
                 timeline.controllers.push(ControllerSample {
                     time,
+                    clock_started,
                     snapshot: sample.snapshot.clone(),
                     continuous,
                     source: sample.source.ip(),

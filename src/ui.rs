@@ -29,7 +29,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         area,
     );
     if !app.controls_visible {
-        frame.render_widget(Paragraph::new("Please resize to at least 60 columns × 16 rows.\nYour notes are preserved; resize to see the controls.").wrap(Wrap { trim: false }), area);
+        frame.render_widget(
+            Paragraph::new(
+                "Please resize to at least 60 columns × 16 rows.\nYour notes are preserved; resize to see the controls.",
+            )
+            .wrap(Wrap { trim: false }),
+            area,
+        );
         return;
     }
     let rows = Layout::vertical([
@@ -240,8 +246,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             let sections =
                 Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(inner);
             frame.render_widget(
-                Paragraph::new("Keep history and raw capture; reacquire the current opponent. First matching GC wins: this may reconnect to the same controller.")
-                    .style(Style::default().fg(FOCUS)).wrap(Wrap { trim: false }),
+                Paragraph::new(
+                    "Keep history and raw capture; reacquire the current opponent. First matching GC wins: this may reconnect to the same controller.",
+                )
+                .style(Style::default().fg(FOCUS))
+                .wrap(Wrap { trim: false }),
                 sections[0],
             );
             frame.render_stateful_widget(

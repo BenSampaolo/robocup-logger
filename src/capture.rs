@@ -127,17 +127,6 @@ impl<P: Record> PacketLog<P> {
     }
 
     pub fn append(&mut self, packets: &[P]) -> io::Result<()> {
-        self.append_with(packets, |file, bytes| {
-            file.write_all(bytes)?;
-            file.sync_all()
-        })
-    }
-
-    fn append_with(
-        &mut self,
-        packets: &[P],
-        write_batch: impl FnOnce(&mut File, &[u8]) -> io::Result<()>,
-    ) -> io::Result<()> {
         let mut next_id = self.next_id;
         let mut bytes = Vec::new();
         for packet in packets {
@@ -158,7 +147,11 @@ impl<P: Record> PacketLog<P> {
         }
         self.file.seek(SeekFrom::Start(self.committed_len))?;
         self.needs_rollback = true;
-        if let Err(error) = write_batch(&mut self.file, &bytes) {
+        if let Err(error) = self
+            .file
+            .write_all(&bytes)
+            .and_then(|()| self.file.sync_all())
+        {
             if let Err(rollback_error) = self.rollback() {
                 return Err(io::Error::new(
                     error.kind(),
@@ -275,4 +268,3 @@ fn check_regular_file(path: &Path) -> io::Result<()> {
 fn invalid_data(error: impl ToString) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
-

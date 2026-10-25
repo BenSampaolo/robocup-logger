@@ -747,7 +747,13 @@ fn text_input(
             Event::Paste(text) => {
                 editor.insert_str(
                     text.chars()
-                        .map(|c| if c.is_control() { ' ' } else { c })
+                        .map(|c| {
+                            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                                ' '
+                            } else {
+                                c
+                            }
+                        })
                         .collect::<String>(),
                 );
             }

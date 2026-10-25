@@ -2,7 +2,10 @@ use ratatui::{
     Frame,
     layout::{Direction, Rect},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Clear, Padding},
+    widgets::{
+        Block, Borders, Clear, Padding,
+        canvas::{Context, Line as Segment},
+    },
 };
 
 pub(crate) const FOCUS: Color = Color::LightYellow;
@@ -10,6 +13,37 @@ pub(crate) const ACCENT: Color = Color::Cyan;
 pub(crate) const MUTED: Color = Color::DarkGray;
 pub(crate) const SUCCESS: Color = Color::Green;
 pub(crate) const ERROR: Color = Color::Red;
+
+pub(crate) fn clipped_line(
+    ctx: &mut Context<'_>,
+    from: (f64, f64),
+    to: (f64, f64),
+    bounds: (f64, f64),
+    color: Color,
+) {
+    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+    let (mut start, mut end) = (0.0_f64, 1.0_f64);
+    for (origin, delta, bound) in [(from.0, dx, bounds.0), (from.1, dy, bounds.1)] {
+        if delta == 0.0 {
+            if origin.abs() > bound {
+                return;
+            }
+        } else {
+            let (a, b) = ((-bound - origin) / delta, (bound - origin) / delta);
+            start = start.max(a.min(b));
+            end = end.min(a.max(b));
+        }
+    }
+    if start <= end {
+        ctx.draw(&Segment::new(
+            (from.0 + start * dx).clamp(-bounds.0, bounds.0),
+            (from.1 + start * dy).clamp(-bounds.1, bounds.1),
+            (from.0 + end * dx).clamp(-bounds.0, bounds.0),
+            (from.1 + end * dy).clamp(-bounds.1, bounds.1),
+            color,
+        ));
+    }
+}
 
 pub(crate) fn solid_panel(frame: &mut Frame, area: Rect, block: Block<'_>, accent: Color) -> Rect {
     let area = area.intersection(frame.area());

@@ -26,7 +26,7 @@ impl Robot {
 #[derive(Default)]
 pub(crate) struct Telemetry {
     pub robots: [Option<Robot>; 5],
-    pub capture_paused: bool,
+    capture_paused: bool,
     socket: Option<UdpSocket>,
     identity: Option<(IpAddr, u8)>,
     last_bind: Option<Instant>,
@@ -34,6 +34,17 @@ pub(crate) struct Telemetry {
 }
 
 impl Telemetry {
+    pub fn set_capture_paused(&mut self, paused: bool) {
+        if self.capture_paused == paused {
+            return;
+        }
+        self.capture_paused = paused;
+        self.socket = None;
+        self.last_bind = None;
+        self.error = None;
+        self.robots = Default::default();
+    }
+
     pub fn poll(
         &mut self,
         source: Option<IpAddr>,
@@ -174,4 +185,3 @@ pub(crate) fn decode(
         },
     )))
 }
-

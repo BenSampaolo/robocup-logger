@@ -1,7 +1,13 @@
+use std::borrow::Cow;
+
 use chrono::{DateTime, FixedOffset, NaiveDate, SecondsFormat};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const MARKDOWN_MARKER: &str = "<!-- robocup-logger generated log -->\n";
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -147,6 +153,8 @@ pub struct Entry {
     pub gc_seconds_remaining: Option<i16>,
     pub kind: EventKind,
     pub text: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub controller_description_edited: bool,
     #[serde(default)]
     pub undone: bool,
     #[serde(default)]
@@ -162,40 +170,68 @@ pub struct Entry {
 }
 
 impl Entry {
-    pub(crate) fn has_controller_snapshot(&self) -> bool {
+    fn controller_snapshot_text(&self) -> Option<&str> {
         if !self.from_controller
+            || self.controller_description_edited
             || self.kind == EventKind::Note
-            || !(self.text.starts_with("GC received: ")
-                || self.text.starts_with("GC sync — received: "))
         {
-            return false;
+            return None;
         }
-        let Some((_, clock)) = self.text.rsplit_once("; secondary ") else {
-            return false;
-        };
+        let text = self
+            .text
+            .strip_prefix("GC received: ")
+            .or_else(|| self.text.strip_prefix("GC sync — received: "))?;
+        let (_, clock) = text.rsplit_once("; secondary ")?;
         let clock = clock
             .strip_suffix("; phase observed on attachment, not the original transition time")
             .unwrap_or(clock);
-        let Some((minutes, seconds)) = clock.split_once(':') else {
-            return false;
-        };
-        minutes.parse::<i16>().is_ok()
+        let (minutes, seconds) = clock.split_once(':')?;
+        (minutes.parse::<i16>().is_ok()
             && seconds.len() == 2
-            && seconds.parse::<u8>().is_ok_and(|seconds| seconds < 60)
+            && seconds.parse::<u8>().is_ok_and(|seconds| seconds < 60))
+        .then_some(text)
+    }
+
+    pub(crate) fn has_controller_snapshot(&self) -> bool {
+        self.controller_snapshot_text().is_some()
+    }
+
+    pub(crate) fn is_controller_sync(&self) -> bool {
+        self.from_controller && self.text.starts_with("GC sync — ")
+    }
+
+    pub(crate) fn controller_phase(&self) -> Option<&'static str> {
+        let summary = self
+            .controller_snapshot_text()?
+            .split_once("; set play: ")?
+            .0
+            .rsplit_once("; ")?
+            .1;
+        let (phase, rest) = summary.split_once(" / ")?;
+        let (state, half) = rest.split_once(" / ")?;
+        if !matches!(state, "Initial" | "Ready" | "Set" | "Playing" | "Finished")
+            || !matches!(half, "first half" | "second half")
+        {
+            return None;
+        }
+        match (phase, state, half) {
+            ("Normal", "Finished", "first half") => Some("half-time"),
+            ("Normal", "Finished", "second half") => Some("full-time"),
+            ("Normal", _, "first half") => Some("first half"),
+            ("Normal", _, "second half") => Some("second half"),
+            ("Extra time", _, "first half") => Some("extra time · first half"),
+            ("Extra time", _, "second half") => Some("extra time · second half"),
+            ("Penalty shootout", _, _) => Some("penalty shootout"),
+            ("Timeout", _, _) => Some("timeout"),
+            _ => None,
+        }
     }
 
     pub(crate) fn display_text(&self) -> String {
-        if !self.has_controller_snapshot() {
+        let Some(text) = self.controller_snapshot_text() else {
             return self.text.clone();
-        }
-        let score = self
-            .text
-            .strip_prefix("GC received: ")
-            .or_else(|| self.text.strip_prefix("GC sync — received: "))
-            .unwrap_or(&self.text)
-            .split(';')
-            .next()
-            .unwrap_or_default();
+        };
+        let score = text.split(';').next().unwrap_or_default();
         let penalties = self
             .statistics
             .as_ref()
@@ -330,6 +366,7 @@ impl Session {
             gc_seconds_remaining: None,
             kind,
             text: String::new(),
+            controller_description_edited: false,
             undone: false,
             from_controller: false,
             message_budget: None,
@@ -450,6 +487,23 @@ impl Session {
         }
     }
 
+    pub(crate) fn teams_for(&self, game: MatchType) -> (Cow<'_, str>, Cow<'_, str>) {
+        if game == MatchType::GoldenGoal {
+            let (home, away) = self.metadata.golden_goal_teams();
+            return (Cow::Borrowed(home), Cow::Borrowed(away));
+        }
+        let tracked = Cow::Borrowed(self.metadata.tracked_team_name());
+        let opponent = match self.official_opponent {
+            Some(opponent) => Cow::Owned(crate::teams::display_name(opponent)),
+            None => Cow::Borrowed(self.metadata.opponent_name()),
+        };
+        if self.metadata.tracked_are_home() {
+            (tracked, opponent)
+        } else {
+            (opponent, tracked)
+        }
+    }
+
     pub fn golden_goal_score(&self) -> (usize, usize) {
         match self.match_type {
             Some(MatchType::GoldenGoal) => return self.score(),
@@ -563,13 +617,13 @@ impl Session {
 
     pub fn markdown(&self) -> String {
         let fixed_golden_goal = self.match_type == Some(MatchType::GoldenGoal);
-        let (home, away) = if fixed_golden_goal {
-            self.current_teams()
+        let (home, away) = self.teams_for(if fixed_golden_goal {
+            MatchType::GoldenGoal
         } else {
-            (self.metadata.home.as_str(), self.metadata.away.as_str())
-        };
-        let home = markdown_text(home);
-        let away = markdown_text(away);
+            MatchType::Official
+        });
+        let home = markdown_text(home.as_ref());
+        let away = markdown_text(away.as_ref());
         let mut output = format!(
             "# Log {} {} {} vs {}\n\n## Robot Assignments\n",
             self.metadata.date.format("%d.%m.%Y"),
@@ -594,13 +648,13 @@ impl Session {
 
     fn markdown_entries(&self, output: &mut String, game: Option<MatchType>) {
         let fixed_golden_goal = game == Some(MatchType::GoldenGoal);
-        let (home, away) = if fixed_golden_goal {
-            self.metadata.golden_goal_teams()
+        let (home, away) = self.teams_for(if fixed_golden_goal {
+            MatchType::GoldenGoal
         } else {
-            (self.metadata.home.as_str(), self.metadata.away.as_str())
-        };
-        let home = markdown_text(home);
-        let away = markdown_text(away);
+            MatchType::Official
+        });
+        let home = markdown_text(home.as_ref());
+        let away = markdown_text(away.as_ref());
         let (test_home, test_away) = self.metadata.golden_goal_teams();
         let test_home = markdown_text(test_home);
         let test_away = markdown_text(test_away);
@@ -622,7 +676,7 @@ impl Session {
             {
                 continue;
             }
-            let gc_sync = gc_snapshot && entry.text.starts_with("GC sync — received: ");
+            let gc_sync = gc_snapshot && entry.is_controller_sync();
             if let Some([home_delta, away_delta]) = entry.score_delta {
                 home_score += i64::from(home_delta);
                 away_score += i64::from(away_delta);

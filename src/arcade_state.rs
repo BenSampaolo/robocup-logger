@@ -179,7 +179,7 @@ impl Cue {
     }
 
     pub(crate) fn from_entry(session: &Session, entry: &Entry, started: Instant) -> Option<Self> {
-        if entry.undone || (entry.from_controller && entry.text.starts_with("GC sync — ")) {
+        if entry.undone || entry.is_controller_sync() {
             return None;
         }
         let golden_goal =

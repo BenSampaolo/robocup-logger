@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Entry, EventKind, MatchType, Session, markdown_text};
+use crate::{
+    game_controller::Snapshot,
+    model::{Entry, EventKind, MatchType, Session, markdown_text},
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -23,6 +26,53 @@ pub struct PenaltyChange {
     pub player: u8,
     pub before: u8,
     pub after: u8,
+}
+
+impl Statistics {
+    pub(crate) fn from_snapshots(snapshot: &Snapshot, previous: Option<&Snapshot>) -> Self {
+        let Some(previous) = previous else {
+            return Self::baseline(
+                snapshot,
+                snapshot.game_phase == 0
+                    && snapshot.first_half
+                    && snapshot.state == 0
+                    && snapshot.tracked_score == 0
+                    && snapshot.opponent_score == 0,
+            );
+        };
+        Self {
+            baseline: None,
+            penalties: previous
+                .tracked_penalties
+                .iter()
+                .zip(snapshot.tracked_penalties)
+                .enumerate()
+                .filter_map(|(index, (&before, after))| {
+                    (before != after).then_some(PenaltyChange {
+                        player: index as u8 + 1,
+                        before,
+                        after,
+                    })
+                })
+                .collect(),
+            opponent_restart: matches!(snapshot.game_phase, 0 | 2)
+                && matches!(snapshot.set_play, 4 | 5)
+                && snapshot.kicking_team == snapshot.opponent_number
+                && (previous.set_play, previous.kicking_team)
+                    != (snapshot.set_play, snapshot.kicking_team),
+        }
+    }
+
+    pub(crate) fn baseline(snapshot: &Snapshot, pre_game: bool) -> Self {
+        Self {
+            baseline: Some(StatisticsBaseline {
+                penalties: snapshot.tracked_penalties,
+                pre_game,
+            }),
+            penalties: Vec::new(),
+            opponent_restart: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default)]

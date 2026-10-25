@@ -242,13 +242,14 @@ struct Detection {
 }
 
 pub struct Receiver {
-    socket: UdpSocket,
+    socket: Option<UdpSocket>,
     probe: crate::discovery::Probe,
     detected: Option<Detection>,
     discovery_only: bool,
     source_from_request: bool,
     tracked_team: u8,
     capture_enabled: bool,
+    capture_paused: bool,
     next_capture_id: u64,
     pub captures: Vec<Packet>,
     opponent_number: Option<u8>,
@@ -282,17 +283,16 @@ impl Receiver {
                 "Choose two distinct supported teams",
             ));
         }
-        let socket = UdpSocket::bind("0.0.0.0:3838")?;
-        socket.set_nonblocking(true)?;
-        socket.set_broadcast(true)?;
+        let socket = Self::open_socket()?;
         Ok(Self {
-            socket,
+            socket: Some(socket),
             probe: crate::discovery::Probe::enabled(),
             detected: None,
             discovery_only: false,
             source_from_request: false,
             tracked_team,
             capture_enabled: false,
+            capture_paused: false,
             next_capture_id: 0,
             captures: Vec::new(),
             opponent_number: None,
@@ -314,7 +314,6 @@ impl Receiver {
             clock_started: None,
         })
     }
-
 
     pub(crate) fn bind_discovery() -> io::Result<Self> {
         let mut receiver = Self::bind(HULKS_TEAM_NUMBER, None)?;
@@ -387,6 +386,20 @@ impl Receiver {
         self.capture_enabled = true;
     }
 
+    pub fn set_capture_paused(&mut self, paused: bool) {
+        if self.capture_paused == paused {
+            return;
+        }
+        self.capture_paused = paused;
+        self.socket = None;
+        self.rebaseline();
+        self.notice = Some(if paused {
+            "GC capture paused — retry saving".into()
+        } else {
+            "GC capture resumed; waiting for a fresh packet".into()
+        });
+    }
+
     pub fn next_capture_id(&self) -> u64 {
         self.next_capture_id
     }
@@ -436,10 +449,16 @@ impl Receiver {
     }
 
     pub fn poll(&mut self) -> io::Result<Vec<Update>> {
+        if self.capture_paused {
+            return Ok(Vec::new());
+        }
+        if self.socket.is_none() {
+            self.socket = Some(Self::open_socket()?);
+        }
         let mut updates = Vec::new();
         let mut buffer = [0; 65536];
         for _ in 0..64 {
-            let (length, source) = match self.socket.recv_from(&mut buffer) {
+            let (length, source) = match self.socket.as_ref().unwrap().recv_from(&mut buffer) {
                 Ok(packet) => packet,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -557,7 +576,8 @@ impl Receiver {
                     .as_ref()
                     .is_none_or(|detected| detected.received_at.elapsed() > STALE_AFTER))
         {
-            self.probe.request(&self.socket, Instant::now());
+            self.probe
+                .request(self.socket.as_ref().unwrap(), Instant::now());
         }
         if let Err(error) = self.request_true_data(Instant::now()) {
             self.notice = Some(format!("GameController true-data request failed: {error}"));
@@ -583,11 +603,21 @@ impl Receiver {
                 .ip(),
             3636,
         );
-        self.socket.send_to(b"RGTr\0", destination)?;
+        self.socket
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "GC capture paused"))?
+            .send_to(b"RGTr\0", destination)?;
         if let Some(source) = self.true_source.take() {
             self.retired_true_source = Some(source);
         }
         Ok(())
+    }
+
+    fn open_socket() -> io::Result<UdpSocket> {
+        let socket = UdpSocket::bind("0.0.0.0:3838")?;
+        socket.set_nonblocking(true)?;
+        socket.set_broadcast(true)?;
+        Ok(socket)
     }
 
     pub fn is_stale(&self) -> bool {
@@ -629,7 +659,6 @@ impl Receiver {
         self.received_at = None;
         self.clock_started = None;
     }
-
 
     fn accept_packet(
         &mut self,
@@ -744,4 +773,3 @@ impl Receiver {
         )
     }
 }
-

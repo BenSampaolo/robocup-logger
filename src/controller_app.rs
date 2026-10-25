@@ -2,7 +2,7 @@ use crate::{
     app::{App, Mode},
     game_controller::{Snapshot, Update, decode_capture},
     model::{EventKind, MatchType},
-    statistics::{PenaltyChange, Statistics, StatisticsBaseline},
+    statistics::Statistics,
 };
 
 impl App {
@@ -290,38 +290,7 @@ impl App {
                         && matches!(packet.game_phase, 0 | 2 | 3)
                         && packet.opponent_number == snapshot.opponent_number
                 });
-                Statistics {
-                    baseline: previous.is_none().then_some(StatisticsBaseline {
-                        penalties: snapshot.tracked_penalties,
-                        pre_game: snapshot.game_phase == 0
-                            && snapshot.first_half
-                            && snapshot.state == 0
-                            && snapshot.tracked_score == 0
-                            && snapshot.opponent_score == 0,
-                    }),
-                    penalties: previous.map_or_else(Vec::new, |packet| {
-                        packet
-                            .tracked_penalties
-                            .iter()
-                            .zip(snapshot.tracked_penalties)
-                            .enumerate()
-                            .filter_map(|(player, (&before, after))| {
-                                (before != after).then_some(PenaltyChange {
-                                    player: player as u8 + 1,
-                                    before,
-                                    after,
-                                })
-                            })
-                            .collect()
-                    }),
-                    opponent_restart: previous.is_some_and(|packet| {
-                        official
-                            && matches!(snapshot.set_play, 4 | 5)
-                            && snapshot.kicking_team == snapshot.opponent_number
-                            && (packet.set_play, packet.kicking_team)
-                                != (snapshot.set_play, snapshot.kicking_team)
-                    }),
-                }
+                Statistics::from_snapshots(snapshot, previous)
             });
         let follow = matches!(self.mode, Mode::Idle | Mode::Writing)
             && self.history.selected() == session.entries.len().checked_sub(1);
@@ -330,6 +299,8 @@ impl App {
         {
             session.official_opponent = Some(snapshot.opponent_number);
         }
+        let (home, away) = session.teams_for(target_game);
+        let (home, away) = (home.into_owned(), away.into_owned());
         session.record(kind, update.received_at);
         let entry = session.entries.last_mut().unwrap();
         if combined {
@@ -344,14 +315,6 @@ impl App {
         if !matches!(kind, EventKind::GoalHome | EventKind::GoalAway) && delta != [0, 0] {
             entry.score_delta = Some(delta);
         }
-        let (home, away) = if combined && target_game == MatchType::GoldenGoal {
-            session.metadata.golden_goal_teams()
-        } else {
-            (
-                session.metadata.home.as_str(),
-                session.metadata.away.as_str(),
-            )
-        };
         let penalty_description = entry
             .statistics
             .as_ref()

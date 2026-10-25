@@ -242,7 +242,7 @@ fn run(
         }
         match event::read()? {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
-                if app.key(key, chrono::Local::now().fixed_offset())? {
+                if app.key(key, chrono::Local::now().fixed_offset()) {
                     return Ok(());
                 }
             }

@@ -21,7 +21,7 @@ use crate::{
     arcade::{self, Cue, Effect},
     field::FieldDimensions,
     model::{EventKind, MatchType, Session},
-    presentation,
+    presentation::{self, clipped_line},
     replay_data::Timeline,
     storage::Store,
 };
@@ -278,7 +278,7 @@ impl Replay {
         }
     }
 
-    pub(crate) fn key(&mut self, key: KeyEvent, _session: &Session) -> bool {
+    pub(crate) fn key(&mut self, key: KeyEvent) -> bool {
         if key.kind == KeyEventKind::Release
             || key
                 .modifiers
@@ -392,7 +392,12 @@ impl Replay {
         let snapshot = &sample.snapshot;
         let running =
             snapshot.state == 3 && !snapshot.stopped && matches!(snapshot.game_phase, 0 | 2);
-        let seconds = f64::from(snapshot.seconds_remaining) - if running { age } else { 0.0 };
+        let fraction = if running {
+            (self.time - sample.clock_started).clamp(0.0, 0.99)
+        } else {
+            0.0
+        };
+        let seconds = f64::from(snapshot.seconds_remaining) - fraction;
         let hundredths = (seconds.abs() * 100.0).round() as u64;
         let title = format!(
             "{}{:02}:{:02}.{:02}",
@@ -744,18 +749,18 @@ impl Replay {
         let margin = dimensions
             .border_strip_width
             .max(dimensions.goal_depth + dimensions.goal_post_diameter / 2.0);
-        let x = (dimensions.length / 2.0 + margin + dimensions.line_width).max(
+        let half_world_width = (dimensions.length / 2.0 + margin + dimensions.line_width).max(
             (dimensions.width / 2.0 + dimensions.border_strip_width + dimensions.line_width)
                 * ratio,
         );
-        let y = x / ratio;
-        let pixel = (2.0 * x / (f64::from(inner.width) * 2.0))
-            .max(2.0 * y / (f64::from(inner.height) * 4.0));
+        let half_world_height = half_world_width / ratio;
+        let pixel = (2.0 * half_world_width / (f64::from(inner.width) * 2.0))
+            .max(2.0 * half_world_height / (f64::from(inner.height) * 4.0));
         let canvas = Canvas::default()
             .marker(Marker::Braille)
             .background_color(Color::Rgb(5, 20, 13))
-            .x_bounds([-x, x])
-            .y_bounds([-y, y])
+            .x_bounds([-half_world_width, half_world_width])
+            .y_bounds([-half_world_height, half_world_height])
             .paint(|ctx| {
                 let strokes = (dimensions.line_width / pixel).ceil().clamp(1.0, 12.0) as usize;
                 for stroke in 0..strokes {
@@ -818,7 +823,13 @@ impl Replay {
                                 radius: 0.12_f64.max(pixel),
                                 color,
                             });
-                            clipped_line(ctx, (rx, ry), (bx, by), (x, y), color);
+                            clipped_line(
+                                ctx,
+                                (rx, ry),
+                                (bx, by),
+                                (half_world_width, half_world_height),
+                                color,
+                            );
                         }
                     }
                 }
@@ -837,7 +848,7 @@ impl Replay {
             frame,
             inner,
             [dimensions.length, dimensions.width],
-            [2.0 * x, 2.0 * y],
+            [2.0 * half_world_width, 2.0 * half_world_height],
             Direction::Vertical,
         );
     }
@@ -869,45 +880,14 @@ fn triangle(ctx: &mut Context<'_>, x: f64, y: f64, heading: f64, color: Color) {
     }
 }
 
-fn clipped_line(
-    ctx: &mut Context<'_>,
-    from: (f64, f64),
-    to: (f64, f64),
-    bounds: (f64, f64),
-    color: Color,
-) {
-    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
-    let (mut start, mut end) = (0.0_f64, 1.0_f64);
-    for (origin, delta, bound) in [(from.0, dx, bounds.0), (from.1, dy, bounds.1)] {
-        if delta == 0.0 {
-            if origin.abs() > bound {
-                return;
-            }
-        } else {
-            let (a, b) = ((-bound - origin) / delta, (bound - origin) / delta);
-            start = start.max(a.min(b));
-            end = end.min(a.max(b));
-        }
-    }
-    if start <= end {
-        ctx.draw(&Segment::new(
-            (from.0 + start * dx).clamp(-bounds.0, bounds.0),
-            (from.1 + start * dy).clamp(-bounds.1, bounds.1),
-            (from.0 + end * dx).clamp(-bounds.0, bounds.0),
-            (from.1 + end * dy).clamp(-bounds.1, bounds.1),
-            color,
-        ));
-    }
-}
-
-fn draw_markings(ctx: &mut Context<'_>, d: &FieldDimensions, offset: f64) {
+fn draw_markings(ctx: &mut Context<'_>, dimensions: &FieldDimensions, offset: f64) {
     let color = Color::Rgb(146, 176, 153);
-    let (half_length, half_width) = (d.length / 2.0, d.width / 2.0);
+    let (half_length, half_width) = (dimensions.length / 2.0, dimensions.width / 2.0);
     ctx.draw(&Rectangle {
         x: -half_length - offset,
         y: -half_width - offset,
-        width: d.length + 2.0 * offset,
-        height: d.width + 2.0 * offset,
+        width: dimensions.length + 2.0 * offset,
+        height: dimensions.width + 2.0 * offset,
         color,
     });
     ctx.draw(&Segment::new(
@@ -920,13 +900,19 @@ fn draw_markings(ctx: &mut Context<'_>, d: &FieldDimensions, offset: f64) {
     ctx.draw(&Circle {
         x: 0.0,
         y: 0.0,
-        radius: d.center_circle_diameter / 2.0 + offset,
+        radius: dimensions.center_circle_diameter / 2.0 + offset,
         color,
     });
     for side in [-1.0, 1.0] {
         for (depth, width) in [
-            (d.goal_box_area_length, d.goal_box_area_width),
-            (d.penalty_area_length, d.penalty_area_width),
+            (
+                dimensions.goal_box_area_length,
+                dimensions.goal_box_area_width,
+            ),
+            (
+                dimensions.penalty_area_length,
+                dimensions.penalty_area_width,
+            ),
         ] {
             ctx.draw(&Rectangle {
                 x: if side < 0.0 {
@@ -941,11 +927,11 @@ fn draw_markings(ctx: &mut Context<'_>, d: &FieldDimensions, offset: f64) {
             });
         }
     }
-    let radius = d.penalty_marker_size / 2.0;
+    let radius = dimensions.penalty_marker_size / 2.0;
     for x in [
         0.0,
-        half_length - d.penalty_marker_distance,
-        -half_length + d.penalty_marker_distance,
+        half_length - dimensions.penalty_marker_distance,
+        -half_length + dimensions.penalty_marker_distance,
     ] {
         ctx.draw(&Segment::new(x - radius, offset, x + radius, offset, color));
         ctx.draw(&Segment::new(
@@ -956,8 +942,8 @@ fn draw_markings(ctx: &mut Context<'_>, d: &FieldDimensions, offset: f64) {
             color,
         ));
     }
-    if d.corner_arc_radius > 0.0 {
-        let radius = (d.corner_arc_radius + offset).max(0.0);
+    if dimensions.corner_arc_radius > 0.0 {
+        let radius = (dimensions.corner_arc_radius + offset).max(0.0);
         for side_x in [-1.0, 1.0] {
             for side_y in [-1.0, 1.0] {
                 let points: Vec<_> = (0..=90)
@@ -978,18 +964,18 @@ fn draw_markings(ctx: &mut Context<'_>, d: &FieldDimensions, offset: f64) {
     }
 }
 
-fn draw_goals(ctx: &mut Context<'_>, d: &FieldDimensions, first_half: bool) {
-    let post = (d.goal_inner_width + d.goal_post_diameter) / 2.0;
+fn draw_goals(ctx: &mut Context<'_>, dimensions: &FieldDimensions, first_half: bool) {
+    let post = (dimensions.goal_inner_width + dimensions.goal_post_diameter) / 2.0;
     for side in [-1.0, 1.0] {
-        let goal_line = side * d.length / 2.0;
+        let goal_line = side * dimensions.length / 2.0;
         ctx.draw(&Rectangle {
             x: if side < 0.0 {
-                goal_line - d.goal_depth
+                goal_line - dimensions.goal_depth
             } else {
                 goal_line
             },
             y: -post,
-            width: d.goal_depth,
+            width: dimensions.goal_depth,
             height: post * 2.0,
             color: if (side < 0.0) == first_half {
                 BLUE
@@ -1001,7 +987,7 @@ fn draw_goals(ctx: &mut Context<'_>, d: &FieldDimensions, first_half: bool) {
             ctx.draw(&Circle {
                 x: goal_line,
                 y,
-                radius: d.goal_post_diameter / 2.0,
+                radius: dimensions.goal_post_diameter / 2.0,
                 color: Color::White,
             });
         }

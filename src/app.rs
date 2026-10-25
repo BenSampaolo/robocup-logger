@@ -296,6 +296,8 @@ impl Form {
             kind,
             timestamp,
             text: self.fields[2].value().to_owned(),
+            controller_description_edited: original.controller_description_edited
+                || (original.from_controller && self.fields[2].value() != original.text),
             gc_seconds_remaining: parse_gc_clock(self.fields[3].value())?,
             score_delta: if kind == original.kind {
                 original.score_delta
@@ -505,7 +507,6 @@ pub struct App {
 }
 
 impl App {
-
     pub fn new_with_settings(path: Option<&Path>, settings: &Settings) -> io::Result<Self> {
         if let Some(path) = path {
             let (store, mut session) = Store::open(path)?;
@@ -627,7 +628,9 @@ impl App {
     }
 
     pub fn poll_telemetry(&mut self) {
-        let Some(session) = &self.session else { return };
+        let Some(session) = &self.session else {
+            return;
+        };
         let source = match &self.controller {
             Some(receiver) => receiver.source.map(|address| address.ip()),
             None => self.discovery.source(),
@@ -637,8 +640,8 @@ impl App {
             .as_ref()
             .filter(|_| self.controller.is_some())
             .map(RobotCaptureLog::next_id);
-        self.telemetry.capture_paused = !self.pending_robot_capture.is_empty()
-            || (next_id.is_some() && self.save_error.is_some());
+        self.telemetry
+            .set_capture_paused(next_id.is_some() && self.save_error.is_some());
         let pending = &mut self.pending_robot_capture;
         self.telemetry.poll(
             source,
@@ -686,6 +689,7 @@ impl App {
                 self.save_error = Some(format!(
                     "Raw capture save failed: {error}. Select Retry saving in Actions; quitting is blocked."
                 ));
+                self.set_capture_paused(true);
                 return;
             }
             self.pending_capture.clear();
@@ -699,20 +703,18 @@ impl App {
                 .and_then(|log| log.append(&self.pending_robot_capture));
             if let Err(error) = result {
                 self.dirty = true;
-                self.telemetry.capture_paused = true;
                 self.save_error = Some(format!(
                     "Robot capture paused: {error}. Select Retry saving in Actions; quitting is blocked."
                 ));
+                self.set_capture_paused(true);
                 return;
             }
             self.pending_robot_capture.clear();
-            self.telemetry.capture_paused = false;
             self.save_error = None;
         }
-        if !self.dirty {
-            return;
-        }
-        if let (Some(store), Some(session)) = (&self.store, &self.session) {
+        if self.dirty
+            && let (Some(store), Some(session)) = (&self.store, &self.session)
+        {
             match store.save(session) {
                 Ok(()) => {
                     self.dirty = false;
@@ -725,6 +727,14 @@ impl App {
                 }
             }
         }
+        self.set_capture_paused(self.save_error.is_some());
+    }
+
+    fn set_capture_paused(&mut self, paused: bool) {
+        if let Some(controller) = &mut self.controller {
+            controller.set_capture_paused(paused);
+        }
+        self.telemetry.set_capture_paused(paused);
     }
 
     fn restore_mode(&mut self) {
@@ -1171,13 +1181,13 @@ impl App {
         false
     }
 
-    pub fn key(&mut self, key: KeyEvent, now: DateTime<FixedOffset>) -> io::Result<bool> {
+    pub fn key(&mut self, key: KeyEvent, now: DateTime<FixedOffset>) -> bool {
         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-            return Ok(false);
+            return false;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('c') {
-            return Ok(self.request_quit());
+            return self.request_quit();
         }
         let text_editing = !self.help_visible
             && (matches!(self.mode, Mode::Writing)
@@ -1220,18 +1230,18 @@ impl App {
             ) {
                 self.help_visible = false;
             }
-            return Ok(false);
+            return false;
         }
         if command.is_none()
             && key.modifiers.contains(KeyModifiers::SHIFT)
             && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
         {
             self.scroll_preview(key.code == KeyCode::PageDown);
-            return Ok(false);
+            return false;
         }
         if command == Some(Command::Help) {
             self.help_visible = true;
-            return Ok(false);
+            return false;
         }
         if !self.controls_visible
             && command == Some(Command::Confirm)
@@ -1245,7 +1255,7 @@ impl App {
                         || (matches!(form.kind, FormKind::Setup)
                             && form.selected == form.fields.len() + 2)))
         {
-            return Ok(false);
+            return false;
         }
         if matches!(self.mode, Mode::Idle) && command == Some(Command::Back) {
             let (message_budget, gc_seconds_remaining) = self.gc_values();
@@ -1256,7 +1266,7 @@ impl App {
                 message_budget,
                 gc_seconds_remaining,
             };
-            return Ok(false);
+            return false;
         }
         let mode = std::mem::replace(&mut self.mode, Mode::Idle);
         match mode {
@@ -1301,7 +1311,7 @@ impl App {
                 let action = match command {
                     Some(Command::Back) => {
                         self.restore_mode();
-                        return Ok(false);
+                        return false;
                     }
                     Some(Command::Up | Command::Left) => {
                         selected = wrap_selection(selected, ACTIONS.len(), false);
@@ -1321,7 +1331,7 @@ impl App {
                     gc_seconds_remaining,
                 };
                 if let Some(action) = action {
-                    return Ok(self.perform_action(action, timestamp));
+                    return self.perform_action(action, timestamp);
                 }
             }
             Mode::ReconnectController { mut selected } => match command {
@@ -1373,11 +1383,11 @@ impl App {
                         Some(Command::Back) => form.discard_selected = None,
                         Some(Command::Confirm) if selected == 1 => {
                             if matches!(form.kind, FormKind::Setup) {
-                                return Ok(true);
+                                return true;
                             }
                             self.restore_mode();
                             self.status = "Form cancelled; previous data kept".into();
-                            return Ok(false);
+                            return false;
                         }
                         Some(Command::Confirm) => form.discard_selected = None,
                         Some(Command::Up | Command::Left | Command::Down | Command::Right) => {
@@ -1404,7 +1414,7 @@ impl App {
                         form.discard_selected = Some(0);
                         self.mode = Mode::Form(form);
                     } else if matches!(form.kind, FormKind::Setup) {
-                        return Ok(true);
+                        return true;
                     } else {
                         self.restore_mode();
                         self.status = "Form cancelled; previous data kept".into();
@@ -1456,7 +1466,7 @@ impl App {
                 }
             },
         }
-        Ok(false)
+        false
     }
 
     fn open_correction(&mut self) {
@@ -1574,7 +1584,13 @@ impl App {
         }
         let text: String = text
             .chars()
-            .map(|ch| if ch.is_control() { ' ' } else { ch })
+            .map(|ch| {
+                if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') {
+                    ' '
+                } else {
+                    ch
+                }
+            })
             .collect();
         match &mut self.mode {
             Mode::Writing => {
@@ -1685,4 +1701,3 @@ fn edit_key(editor: &mut TextArea<'static>, key: KeyEvent) -> bool {
         _ => false,
     }
 }
-

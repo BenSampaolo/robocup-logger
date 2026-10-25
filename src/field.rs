@@ -14,7 +14,7 @@ use ratatui::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    presentation::{ACCENT, MUTED, solid_panel},
+    presentation::{ACCENT, MUTED, clipped_line, solid_panel},
     telemetry::Telemetry,
 };
 
@@ -265,7 +265,7 @@ pub(crate) fn draw(
                 for edge in 0..3 {
                     let (x1, y1) = vertices[edge];
                     let (x2, y2) = vertices[(edge + 1) % 3];
-                    draw_clipped_edge(
+                    clipped_line(
                         ctx,
                         (x1, y1),
                         (x2, y2),
@@ -303,44 +303,13 @@ pub(crate) fn draw(
     }
 }
 
-fn draw_clipped_edge(
-    ctx: &mut Context<'_>,
-    from: (f64, f64),
-    to: (f64, f64),
-    bounds: (f64, f64),
-    color: Color,
-) {
-    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
-    let (mut start, mut end) = (0.0_f64, 1.0_f64);
-    for (origin, delta, bound) in [(from.0, dx, bounds.0), (from.1, dy, bounds.1)] {
-        if delta == 0.0 {
-            if origin.abs() > bound {
-                return;
-            }
-        } else {
-            let (a, b) = ((-bound - origin) / delta, (bound - origin) / delta);
-            start = start.max(a.min(b));
-            end = end.min(a.max(b));
-        }
-    }
-    if start <= end {
-        ctx.draw(&Segment::new(
-            (from.0 + start * dx).clamp(-bounds.0, bounds.0),
-            (from.1 + start * dy).clamp(-bounds.1, bounds.1),
-            (from.0 + end * dx).clamp(-bounds.0, bounds.0),
-            (from.1 + end * dy).clamp(-bounds.1, bounds.1),
-            color,
-        ));
-    }
-}
-
-fn draw_markings(ctx: &mut Context<'_>, d: &FieldDimensions, offset: f64) {
-    let (half_width, half_length) = (d.width / 2.0, d.length / 2.0);
+fn draw_markings(ctx: &mut Context<'_>, dimensions: &FieldDimensions, offset: f64) {
+    let (half_width, half_length) = (dimensions.width / 2.0, dimensions.length / 2.0);
     ctx.draw(&Rectangle {
         x: -half_width - offset,
         y: -half_length - offset,
-        width: d.width + 2.0 * offset,
-        height: d.length + 2.0 * offset,
+        width: dimensions.width + 2.0 * offset,
+        height: dimensions.length + 2.0 * offset,
         color: FIELD_COLOR,
     });
     ctx.draw(&Segment::new(
@@ -353,13 +322,19 @@ fn draw_markings(ctx: &mut Context<'_>, d: &FieldDimensions, offset: f64) {
     ctx.draw(&Circle {
         x: 0.0,
         y: 0.0,
-        radius: d.center_circle_diameter / 2.0 + offset,
+        radius: dimensions.center_circle_diameter / 2.0 + offset,
         color: FIELD_COLOR,
     });
     for side in [-1.0, 1.0] {
         for (width, depth) in [
-            (d.goal_box_area_width, d.goal_box_area_length),
-            (d.penalty_area_width, d.penalty_area_length),
+            (
+                dimensions.goal_box_area_width,
+                dimensions.goal_box_area_length,
+            ),
+            (
+                dimensions.penalty_area_width,
+                dimensions.penalty_area_length,
+            ),
         ] {
             let y = if side > 0.0 {
                 half_length - depth
@@ -377,10 +352,10 @@ fn draw_markings(ctx: &mut Context<'_>, d: &FieldDimensions, offset: f64) {
     }
     for y in [
         0.0,
-        half_length - d.penalty_marker_distance,
-        -half_length + d.penalty_marker_distance,
+        half_length - dimensions.penalty_marker_distance,
+        -half_length + dimensions.penalty_marker_distance,
     ] {
-        let radius = d.penalty_marker_size / 2.0;
+        let radius = dimensions.penalty_marker_size / 2.0;
         ctx.draw(&Segment::new(
             -radius,
             y + offset,
@@ -396,8 +371,8 @@ fn draw_markings(ctx: &mut Context<'_>, d: &FieldDimensions, offset: f64) {
             FIELD_COLOR,
         ));
     }
-    if d.corner_arc_radius > 0.0 {
-        let radius = (d.corner_arc_radius + offset).max(0.0);
+    if dimensions.corner_arc_radius > 0.0 {
+        let radius = (dimensions.corner_arc_radius + offset).max(0.0);
         for x_side in [-1.0, 1.0] {
             for y_side in [-1.0, 1.0] {
                 let points: Vec<_> = (0..=90)
@@ -418,26 +393,26 @@ fn draw_markings(ctx: &mut Context<'_>, d: &FieldDimensions, offset: f64) {
     }
 }
 
-fn draw_goals(ctx: &mut Context<'_>, d: &FieldDimensions) {
-    let post_x = (d.goal_inner_width + d.goal_post_diameter) / 2.0;
+fn draw_goals(ctx: &mut Context<'_>, dimensions: &FieldDimensions) {
+    let post_x = (dimensions.goal_inner_width + dimensions.goal_post_diameter) / 2.0;
     for side in [-1.0, 1.0] {
-        let goal_line = side * d.length / 2.0;
+        let goal_line = side * dimensions.length / 2.0;
         ctx.draw(&Rectangle {
             x: -post_x,
             y: if side > 0.0 {
                 goal_line
             } else {
-                goal_line - d.goal_depth
+                goal_line - dimensions.goal_depth
             },
             width: post_x * 2.0,
-            height: d.goal_depth,
+            height: dimensions.goal_depth,
             color: FIELD_COLOR,
         });
         for x in [-post_x, post_x] {
             ctx.draw(&Circle {
                 x,
                 y: goal_line,
-                radius: d.goal_post_diameter / 2.0,
+                radius: dimensions.goal_post_diameter / 2.0,
                 color: Color::White,
             });
         }
