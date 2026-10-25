@@ -46,7 +46,6 @@ struct Aggregate {
     ended: bool,
 }
 
-// Cautioned and Substitute are roster/card states, not penalty episodes.
 fn is_penalty(code: u8) -> Option<bool> {
     match code {
         0 | 11 | 13 => Some(false),
@@ -151,7 +150,6 @@ impl Aggregate {
         for (seen, &code) in self.seen_penalty.iter_mut().zip(&self.codes) {
             *seen |= is_penalty(code) == Some(true);
         }
-        // Apply the complete packet first: simultaneous changes have no known internal order.
         self.peak_penalties = self.peak_penalties.max(
             self.codes
                 .iter()
@@ -179,7 +177,6 @@ impl Aggregate {
         };
         let was_active = is_penalty(self.codes[player]) == Some(true);
         if after && was_active && self.counted_episode[player] {
-            // A reason correction reclassifies the current episode, not a second penalty.
             if self.codes[player] == 5 && change.after != 5 {
                 self.penalties[player].incapable -= 1;
             } else if self.codes[player] != 5 && change.after == 5 {
@@ -192,7 +189,6 @@ impl Aggregate {
         } else if !after {
             self.counted_episode[player] = false;
         }
-        // Nonzero-to-nonzero changes never recreate an episode whose start was removed.
         self.codes[player] = change.after;
     }
 }

@@ -28,6 +28,7 @@ pub(crate) enum Launch {
     NewFromController((u8, u8)),
     Resume(PathBuf),
     Postgame(Option<PathBuf>),
+    Replay(Option<PathBuf>),
 }
 
 pub(crate) fn run(
@@ -52,8 +53,9 @@ pub(crate) fn run(
             "New match from GC",
             "Resume match",
             "Postgame meeting",
-            "Manage sessions / recordings",
+            "Manage sessions",
             "Settings",
+            "Replay game",
         ]
         .map(str::to_owned)
         .to_vec();
@@ -109,19 +111,26 @@ pub(crate) fn run(
                 }
             }
             Some(5) => edit_settings(terminal, settings)?,
+            Some(6) => {
+                if let Some(path) = pick_session(terminal, settings)? {
+                    return Ok(Some(Launch::Replay(Some(path))));
+                }
+            }
             Some(index) if (recent_start..recent_start + recent.len()).contains(&index) => {
                 let path = &recent[index - recent_start];
                 match choose(
                     terminal,
                     "Home / Recent session",
-                    &["Resume match", "Postgame meeting", "Cancel"].map(str::to_owned),
+                    &["Resume match", "Postgame meeting", "Replay game", "Cancel"]
+                        .map(str::to_owned),
                     &settings.keys,
-                    &mut 2,
+                    &mut 3,
                     &path.display().to_string(),
                     Some(("RoboCup logger / Home", &items, selected, false)),
                 )? {
                     Some(0) => return Ok(Some(Launch::Resume(path.clone()))),
                     Some(1) => return Ok(Some(Launch::Postgame(Some(path.clone())))),
+                    Some(2) => return Ok(Some(Launch::Replay(Some(path.clone())))),
                     _ => {}
                 }
             }
@@ -257,7 +266,6 @@ impl MenuSearch {
         }
         if self.editing {
             let indices = self.indices(items);
-            // Keep ../ reachable without making it the default result of every search.
             *selected = indices
                 .iter()
                 .copied()
@@ -748,10 +756,8 @@ fn text_input(
     }
 }
 
-const SETTING_LABELS: [&str; 11] = [
+const SETTING_LABELS: [&str; 9] = [
     "Log folder",
-    "Python interpreter",
-    "Whisper model cache",
     "Default event",
     "Tracked team",
     "Opponent",
@@ -765,8 +771,6 @@ const SETTING_LABELS: [&str; 11] = [
 fn setting_values(settings: &Settings) -> Vec<String> {
     let mut values = vec![
         settings.log_directory.display().to_string(),
-        settings.python.display().to_string(),
-        settings.model_cache.display().to_string(),
         settings.event.clone(),
         settings.home.clone(),
         settings.away.clone(),
@@ -778,12 +782,10 @@ fn setting_values(settings: &Settings) -> Vec<String> {
 fn set_field(settings: &mut Settings, index: usize, value: String) {
     match index {
         0 => settings.log_directory = value.into(),
-        1 => settings.python = value.into(),
-        2 => settings.model_cache = value.into(),
-        3 => settings.event = value,
-        4 => settings.home = value,
-        5 => settings.away = value,
-        6..=10 => settings.robots[index - 6] = value,
+        1 => settings.event = value,
+        2 => settings.home = value,
+        3 => settings.away = value,
+        4..=8 => settings.robots[index - 4] = value,
         _ => unreachable!("settings field index"),
     }
 }
@@ -798,7 +800,15 @@ fn edit_settings(terminal: &mut Terminal<impl Backend>, settings: &mut Settings)
             .zip(&values)
             .map(|(label, value)| format!("{label}: {value}"))
             .collect();
-        items.extend(["Keybindings…", "Save settings", "Cancel changes"].map(str::to_owned));
+        items.extend(
+            [
+                "Field dimensions…",
+                "Keybindings…",
+                "Save settings",
+                "Cancel changes",
+            ]
+            .map(str::to_owned),
+        );
         let choice = choose(
             terminal,
             "Home / Settings",
@@ -809,7 +819,7 @@ fn edit_settings(terminal: &mut Terminal<impl Backend>, settings: &mut Settings)
             None,
         )?;
         match choice {
-            Some(choice @ (4 | 5)) => {
+            Some(choice @ (2 | 3)) => {
                 let teams: Vec<_> = TEAMS
                     .iter()
                     .map(|(number, name)| format!("{name} (#{number})"))
@@ -830,14 +840,17 @@ fn edit_settings(terminal: &mut Terminal<impl Backend>, settings: &mut Settings)
                     set_field(&mut draft, choice, TEAMS[team].1.to_owned());
                 }
             }
-            Some(choice @ 0..=10) => {
+            Some(choice @ 0..=8) => {
                 if let Some(value) = text_input(terminal, SETTING_LABELS[choice], &values[choice])?
                 {
                     set_field(&mut draft, choice, value);
                 }
             }
-            Some(11) => edit_bindings(terminal, &settings.keys, &mut draft.keys)?,
-            Some(12) => match draft.save() {
+            Some(9) => {
+                edit_field_dimensions(terminal, &settings.keys, &mut draft.field_dimensions)?
+            }
+            Some(10) => edit_bindings(terminal, &settings.keys, &mut draft.keys)?,
+            Some(11) => match draft.save() {
                 Ok(()) => {
                     *settings = draft;
                     return Ok(());
@@ -864,6 +877,117 @@ fn edit_settings(terminal: &mut Terminal<impl Backend>, settings: &mut Settings)
                 {
                     return Ok(());
                 }
+            }
+        }
+    }
+}
+
+pub(crate) fn confirm_replay_field(
+    terminal: &mut Terminal<impl Backend>,
+    settings: &Settings,
+    store: &Store,
+    session: &mut crate::model::Session,
+) -> io::Result<bool> {
+    if session.field_dimensions.is_some() {
+        return Ok(true);
+    }
+    let mut draft = settings.field_dimensions.clone();
+    let mut selected = 0;
+    loop {
+        let choice = choose(
+            terminal,
+            "Replay / missing field dimensions",
+            &[
+                "Cancel",
+                "Review / edit all dimensions",
+                "Confirm and save these dimensions",
+            ]
+            .map(str::to_owned),
+            &settings.keys,
+            &mut selected,
+            &format!(
+                "No field dimensions were recorded. Confirm the actual field before replay.\nStarting values: {} × {} m; goal width {} m.",
+                draft.length, draft.width, draft.goal_inner_width
+            ),
+            None,
+        )?;
+        match choice {
+            Some(1) => edit_field_dimensions(terminal, &settings.keys, &mut draft)?,
+            Some(2) => {
+                if let Err(error) = draft.validate() {
+                    show_error(terminal, &settings.keys, &error)?;
+                    continue;
+                }
+                session.field_dimensions = Some(draft);
+                store.save(session)?;
+                return Ok(true);
+            }
+            _ => return Ok(false),
+        }
+    }
+}
+
+fn edit_field_dimensions(
+    terminal: &mut Terminal<impl Backend>,
+    keys: &Keybindings,
+    draft: &mut crate::field::FieldDimensions,
+) -> io::Result<()> {
+    let mut selected = 0;
+    loop {
+        let fields = [
+            ("Field length", &mut draft.length),
+            ("Field width", &mut draft.width),
+            ("Line width", &mut draft.line_width),
+            ("Goal depth", &mut draft.goal_depth),
+            ("Goal inner width", &mut draft.goal_inner_width),
+            ("Goal post diameter", &mut draft.goal_post_diameter),
+            ("Goal box length", &mut draft.goal_box_area_length),
+            ("Goal box width", &mut draft.goal_box_area_width),
+            ("Penalty area length", &mut draft.penalty_area_length),
+            ("Penalty area width", &mut draft.penalty_area_width),
+            (
+                "Penalty marker distance",
+                &mut draft.penalty_marker_distance,
+            ),
+            ("Centre circle diameter", &mut draft.center_circle_diameter),
+            ("Border strip width", &mut draft.border_strip_width),
+            ("Corner arc radius", &mut draft.corner_arc_radius),
+            ("Penalty marker size", &mut draft.penalty_marker_size),
+        ];
+        let mut items: Vec<_> = fields
+            .iter()
+            .map(|(label, value)| format!("{label}: {value} m"))
+            .collect();
+        items.push("Back".into());
+        let Some(index) = choose(
+            terminal,
+            "Settings / Field dimensions (metres)",
+            &items,
+            keys,
+            &mut selected,
+            "",
+            None,
+        )?
+        .filter(|&index| index < fields.len()) else {
+            return Ok(());
+        };
+        let (label, value) = fields.into_iter().nth(index).unwrap();
+        if let Some(text) = text_input(terminal, label, &value.to_string())? {
+            if let Some(number) = text
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite())
+            {
+                *value = number;
+            } else {
+                message(
+                    terminal,
+                    keys,
+                    ERROR,
+                    "Field dimension not changed",
+                    "Enter a finite number in metres.",
+                )?;
             }
         }
     }
@@ -974,7 +1098,6 @@ fn manage(
         let items = [
             "Regenerate match Markdown",
             "Rebuild missing GC statistics",
-            "Browse meeting recordings / transcripts",
             "Open log folder",
             "Back",
         ]
@@ -1015,11 +1138,7 @@ fn manage(
                 }
                 rebuild_file(path)
             }
-            2 => {
-                recordings(terminal, &settings.keys, path)?;
-                continue;
-            }
-            3 => crate::folders::open(path).map(|()| "Opened the session log folder.".into()),
+            2 => crate::folders::open(path).map(|()| "Opened the session log folder.".into()),
             _ => return Ok(()),
         };
         match result {
@@ -1053,121 +1172,4 @@ fn rebuild_file(path: &Path) -> io::Result<String> {
         "Rebuilt {changed} statistics records.\n{}",
         store.markdown_path().display()
     ))
-}
-
-fn recordings(
-    terminal: &mut Terminal<impl Backend>,
-    keys: &Keybindings,
-    session: &Path,
-) -> io::Result<()> {
-    let root = session.with_extension("postgame");
-    let directories = (|| -> io::Result<Vec<PathBuf>> {
-        let mut directories = Vec::new();
-        for entry in fs::read_dir(&root)? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                directories.push(entry.path());
-            }
-        }
-        directories.sort();
-        directories.reverse();
-        Ok(directories)
-    })();
-    let directories = match directories {
-        Ok(directories) if !directories.is_empty() => directories,
-        Ok(_) => {
-            return message(
-                terminal,
-                keys,
-                FOCUS,
-                "Meeting recordings",
-                "No meeting recordings found.",
-            );
-        }
-        Err(error) => {
-            return message(
-                terminal,
-                keys,
-                ERROR,
-                "Meeting recordings",
-                &format!("{}: {error}", root.display()),
-            );
-        }
-    };
-    let items: Vec<_> = directories
-        .iter()
-        .map(|path| {
-            path.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned()
-        })
-        .collect();
-    let mut selected = 0;
-    while let Some(index) = choose(
-        terminal,
-        "Manage / Meeting recordings",
-        &items,
-        keys,
-        &mut selected,
-        "",
-        None,
-    )? {
-        let path = &directories[index];
-        view_transcript(terminal, keys, path)?;
-    }
-    Ok(())
-}
-
-fn view_transcript(
-    terminal: &mut Terminal<impl Backend>,
-    keys: &Keybindings,
-    directory: &Path,
-) -> io::Result<()> {
-    let mut viewer = match crate::transcript_viewer::Viewer::load(directory) {
-        Ok(viewer) => viewer,
-        Err(error) => {
-            return message(
-                terminal,
-                keys,
-                ERROR,
-                "Transcript unavailable",
-                &format!(
-                    "Folder: {}\n{error}\nUse Postgame → continue without recording → Retry transcription for the latest meeting.",
-                    directory.display()
-                ),
-            );
-        }
-    };
-    loop {
-        terminal.draw(|frame| viewer.draw(frame, frame.area(), keys))?;
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-        if key.kind == KeyEventKind::Release {
-            continue;
-        }
-        if (matches!(key.code, KeyCode::Char('c' | 'C'))
-            && key.modifiers.contains(KeyModifiers::CONTROL))
-            || viewer.key(key, keys)
-        {
-            return Ok(());
-        }
-        if keys.command(key) == Some(Command::Help) {
-            message(
-                terminal,
-                keys,
-                ACCENT,
-                "Transcript controls",
-                &format!(
-                    "{}/{}: choose topic\n{}/{}: scroll\nPgUp/PgDn, Home/End: scroll the note and discussion\n{}: return to recordings",
-                    keys.hint(Command::Up),
-                    keys.hint(Command::Down),
-                    keys.hint(Command::Left),
-                    keys.hint(Command::Right),
-                    keys.hint(Command::Back)
-                ),
-            )?;
-        }
-    }
 }

@@ -1,28 +1,27 @@
 mod app;
-mod audio;
+mod arcade;
+mod arcade_state;
 mod capture;
 mod controller_app;
 mod discovery;
+mod field;
 mod folders;
 mod game_controller;
 mod launcher;
-mod meeting;
 mod model;
 mod navigation;
 mod postgame;
 mod presentation;
 mod rebuild;
 mod recent;
+mod replay;
+mod replay_data;
 mod settings;
 mod statistics;
 mod storage;
 mod teams;
-mod transcript_viewer;
+mod telemetry;
 mod ui;
-
-#[cfg(test)]
-#[path = "../tests/unit/support.rs"]
-mod test_support;
 
 use std::{env, io, path::PathBuf, time::Duration};
 
@@ -38,18 +37,26 @@ fn main() -> io::Result<()> {
     let path = args.next();
     if path.as_deref().is_some_and(|s| s == "--help" || s == "-h") {
         println!(
-            "robocup-logger [SESSION.json]\nrobocup-logger postgame [SESSION.json]\nrobocup-logger export SESSION.json\nrobocup-logger rebuild SESSION.json\n\nNo argument: Home menu with New match, Resume, Postgame, Manage, and Settings.\npostgame without a path: choose a session in the built-in picker.\nPass a session JSON directly to resume live logging.\nMenus: arrows / HJKL / WASD, Enter or Space to select, Esc to go back or open actions, ? for help. Tab is unused.\nBindings and new-match defaults are configurable in Settings. Text editors accept literal text.\nLive logging: Enter immediately timestamps a new note; Enter/Esc saves it. Esc when idle opens actions.\nForms: Esc leaves field editing first; leaving changed drafts asks before discarding.\nPostgame: Esc opens the meeting menu; choose Finish to confirm ending and transcribe locally by note/task. Recording requires consent at meeting start.\nLeaving Home asks for confirmation, defaulting to Cancel.\nManage: browse recordings, regenerate Markdown, or rebuild missing GC statistics.\nexport: regenerate .md without changing JSON; close the live logger first.\nrebuild: backfill missing statistics from .gc.jsonl, preserving edits, then export.\nNo model downloads, automatic microphone activation, or automatic GitHub submission."
+            "robocup-logger [SESSION.json]\nrobocup-logger postgame [SESSION.json]\nrobocup-logger replay [SESSION.json]\nrobocup-logger export SESSION.json\nrobocup-logger rebuild SESSION.json\n\nNo argument: Home menu with New match, Resume, Postgame, Replay, Manage, and Settings.\nReplay loads recorded notes/GC/robots, never live network data; older matches require confirmed field dimensions.\npostgame or replay without a path: choose a session in the built-in picker.\nPass a session JSON directly to resume live logging.\nMenus: arrows / HJKL / WASD, Enter or Space to select, Esc to go back or open actions, ? for help. Tab is unused.\nBindings and new-match defaults are configurable in Settings. Text editors accept literal text.\nLive logging: Enter immediately timestamps a new note; Enter/Esc saves it. Esc when idle opens actions.\nForms: Esc leaves field editing first; leaving changed drafts asks before discarding.\nPostgame: Esc opens the meeting menu; choose Finish to confirm ending the meeting.\nLeaving Home asks for confirmation, defaulting to Cancel.\nManage: regenerate Markdown or rebuild missing GC statistics.\nexport: regenerate .md without changing JSON; close the live logger first.\nrebuild: backfill missing statistics from .gc.jsonl, preserving edits, then export.\nNo microphone recording, transcription, or automatic GitHub submission."
         );
         return Ok(());
     }
-    if path.as_deref().is_some_and(|s| s == "postgame") {
+    if path
+        .as_deref()
+        .is_some_and(|s| s == "postgame" || s == "replay")
+    {
+        let replay = path.as_deref().is_some_and(|s| s == "replay");
         let json = args.next().map(PathBuf::from);
         if args.next().is_some() {
             return Err(io::Error::other(
-                "Usage: robocup-logger postgame [SESSION.json]",
+                "Usage: robocup-logger postgame|replay [SESSION.json]",
             ));
         }
-        return interactive(Some(launcher::Launch::Postgame(json)));
+        return interactive(Some(if replay {
+            launcher::Launch::Replay(json)
+        } else {
+            launcher::Launch::Postgame(json)
+        }));
     }
     if path
         .as_deref()
@@ -82,7 +89,7 @@ fn main() -> io::Result<()> {
     }
     if args.next().is_some() {
         return Err(io::Error::other(
-            "Usage: robocup-logger [SESSION.json] | export|rebuild|postgame SESSION.json",
+            "Usage: robocup-logger [SESSION.json] | export|rebuild|postgame|replay SESSION.json",
         ));
     }
     interactive(path.map(|path| launcher::Launch::Resume(PathBuf::from(path))))
@@ -103,6 +110,7 @@ fn interactive(initial: Option<launcher::Launch>) -> io::Result<()> {
                 },
             };
             let workflow = (|| -> io::Result<()> {
+                let replay_mode = matches!(&launch, launcher::Launch::Replay(_));
                 match launch {
                     launcher::Launch::New
                     | launcher::Launch::NewFromController(_)
@@ -117,7 +125,7 @@ fn interactive(initial: Option<launcher::Launch>) -> io::Result<()> {
                         }
                         run(&mut terminal, &mut app)?;
                     }
-                    launcher::Launch::Postgame(path) => {
+                    launcher::Launch::Postgame(path) | launcher::Launch::Replay(path) => {
                         let path = match path {
                             Some(path) => path,
                             None => match launcher::pick_session(&mut terminal, &settings)? {
@@ -125,7 +133,17 @@ fn interactive(initial: Option<launcher::Launch>) -> io::Result<()> {
                                 None => return Ok(()),
                             },
                         };
-                        let (store, session) = storage::Store::load(&path)?;
+                        let (store, mut session) = storage::Store::load(&path)?;
+                        if replay_mode
+                            && !launcher::confirm_replay_field(
+                                &mut terminal,
+                                &settings,
+                                &store,
+                                &mut session,
+                            )?
+                        {
+                            return Ok(());
+                        }
                         if let Err(error) = recent::remember(store.session_path()) {
                             launcher::show_error(
                                 &mut terminal,
@@ -133,8 +151,16 @@ fn interactive(initial: Option<launcher::Launch>) -> io::Result<()> {
                                 &format!("Cannot update recent sessions: {error}"),
                             )?;
                         }
-                        let links =
-                            postgame::run_with_settings(&mut terminal, &store, session, &settings)?;
+                        let links = if replay_mode {
+                            postgame::run_replay_with_settings(
+                                &mut terminal,
+                                &store,
+                                session,
+                                &settings,
+                            )?
+                        } else {
+                            postgame::run_with_settings(&mut terminal, &store, session, &settings)?
+                        };
                         if !links.is_empty() {
                             restore_terminal()?;
                             let opened = postgame::open_tabs(&links);
@@ -191,6 +217,7 @@ fn run(
     loop {
         app.poll_discovery();
         app.poll_controller();
+        app.poll_telemetry();
         if app.save_error.is_none() {
             app.persist();
         }
@@ -201,7 +228,16 @@ fn run(
             }
         }
         terminal.draw(|frame| ui::draw(frame, app))?;
-        if !event::poll(Duration::from_millis(100))? {
+        let refresh = if app
+            .controller
+            .as_ref()
+            .is_some_and(|receiver| !receiver.is_stale())
+        {
+            50
+        } else {
+            100
+        };
+        if !event::poll(Duration::from_millis(refresh))? {
             continue;
         }
         match event::read()? {

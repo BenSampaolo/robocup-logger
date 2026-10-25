@@ -1,6 +1,6 @@
 use ratatui::{
     Frame,
-    layout::Rect,
+    layout::{Direction, Rect},
     style::{Color, Modifier, Style},
     widgets::{Block, Borders, Clear, Padding},
 };
@@ -19,7 +19,6 @@ pub(crate) fn solid_panel(frame: &mut Frame, area: Rect, block: Block<'_>, accen
         area.width.saturating_sub(2),
         area.height,
     );
-    // Equal foreground/background fills the whole cell, independently of the line glyph/font.
     let band = Style::default().fg(accent).bg(accent);
     let block = block
         .borders(Borders::ALL)
@@ -38,6 +37,39 @@ pub(crate) fn solid_panel(frame: &mut Frame, area: Rect, block: Block<'_>, accen
     inner
 }
 
+pub(crate) fn grass_stripes(
+    frame: &mut Frame,
+    plot: Rect,
+    pitch: [f64; 2],
+    world: [f64; 2],
+    direction: Direction,
+) {
+    let axis = if direction == Direction::Horizontal {
+        1
+    } else {
+        0
+    };
+    for row in 0..plot.height {
+        for column in 0..plot.width {
+            let position = [
+                (f64::from(column) + 0.5) / f64::from(plot.width) - 0.5,
+                0.5 - (f64::from(row) + 0.5) / f64::from(plot.height),
+            ];
+            let point = [position[0] * world[0], position[1] * world[1]];
+            if point[0].abs() > pitch[0] / 2.0 || point[1].abs() > pitch[1] / 2.0 {
+                continue;
+            }
+            let band = (((point[axis] / pitch[axis] + 0.5) * 12.0).floor() as usize).min(11);
+            let color = if band % 2 == 0 {
+                Color::Rgb(18, 52, 33)
+            } else {
+                Color::Rgb(25, 70, 43)
+            };
+            frame.buffer_mut()[(plot.x + column, plot.y + row)].set_bg(color);
+        }
+    }
+}
+
 pub(crate) fn popup(
     frame: &mut Frame,
     area: Rect,
@@ -54,7 +86,6 @@ pub(crate) fn popup(
             .bg(Color::Black)
             .remove_modifier(Modifier::BOLD | Modifier::REVERSED),
     );
-    // Grow outward for the wider sides and padding; keep the original content width when possible.
     let width = width.saturating_add(2).min(area.width);
     let horizontal = (area.width.saturating_sub(width) / 2).min(2);
     let vertical = (area.height.saturating_sub(height) / 2).min(1);

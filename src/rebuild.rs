@@ -7,7 +7,6 @@ use crate::{
     statistics::{PenaltyChange, Statistics, StatisticsBaseline},
 };
 
-/// Backfill statistics only: recorded goals, phases, edits and removals remain authoritative.
 pub fn rebuild(session: &mut Session, packets: &[Packet]) -> Result<usize, String> {
     let snapshots = validate(session, packets)?;
     let official = official_entries(session);
@@ -49,8 +48,6 @@ pub fn rebuild(session: &mut Session, packets: &[Packet]) -> Result<usize, Strin
                 && (chrono::Duration::zero()..=chrono::Duration::seconds(5))
                     .contains(&packet.received_at.signed_duration_since(last.received_at))
         });
-        // A crash can archive a goal/phase packet before its history entry is saved.
-        // Never reconstruct it or silently claim complete coverage of the user's score.
         let missing_history = existing.is_none()
             && previous.is_some_and(|(_, before)| history_changed(before, snapshot));
         let mut statistics = derive(snapshot, continuous.map(|(_, snapshot)| snapshot));
@@ -61,7 +58,6 @@ pub fn rebuild(session: &mut Session, packets: &[Packet]) -> Result<usize, Strin
 
         if let Some(index) = existing {
             if session.entries[index].statistics.is_none() {
-                // Insertions may have shifted the original entry's index.
                 let entry = candidate
                     .entries
                     .iter_mut()
@@ -207,8 +203,6 @@ fn official_at(session: &Session, official: &[bool], existing: Option<usize>, id
         Some(MatchType::Official) => true,
         Some(MatchType::GoldenGoal) => false,
         Some(MatchType::Combined) | None => {
-            // The raw scope must also agree with an existing history anchor. The
-            // following anchored event bounds where insertion belongs in history.
             let index = insertion_index(session, id).min(session.entries.len().saturating_sub(1));
             official
                 .get(index)
@@ -233,7 +227,6 @@ fn closed_periods(
             if !is_official || end.from_controller || end.kind != EventKind::GameEnd {
                 return None;
             }
-            // Undo/restore changes the visible history, not which packets were imported.
             let reopen = session
                 .entries
                 .iter()

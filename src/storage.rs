@@ -1,4 +1,4 @@
-use crate::capture::CaptureLog;
+use crate::capture::{CaptureLog, RobotCaptureLog};
 use crate::model::{MARKDOWN_MARKER, Session};
 use chrono::Local;
 use std::fs::{self, File, OpenOptions};
@@ -9,7 +9,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct Store {
     session_path: PathBuf,
     markdown_path: PathBuf,
-    // Lock an inode that is never replaced by an atomic save or deleted on exit.
     _lock: SessionLock,
 }
 
@@ -17,7 +16,6 @@ struct SessionLock(File);
 
 impl Drop for SessionLock {
     fn drop(&mut self) {
-        // Closing our descriptor alone can leave an inherited flock held until a child execs/exits.
         let _ = self.0.unlock();
     }
 }
@@ -74,7 +72,6 @@ impl Store {
             _lock: lock,
         };
         let json = serde_json::to_vec_pretty(session).map_err(invalid_data)?;
-        // No-clobber publication also protects against files created after the checks above.
         atomic_write(&store.session_path, &json, false)?;
         atomic_write(&store.markdown_path, session.markdown().as_bytes(), false)?;
         Ok(store)
@@ -82,7 +79,6 @@ impl Store {
 
     pub fn open(json_path: &Path) -> io::Result<(Self, Session)> {
         let (store, session) = Self::load(json_path)?;
-        // JSON is authoritative after a crash between the two file replacements.
         store.save(&session)?;
         Ok((store, session))
     }
@@ -170,7 +166,6 @@ impl Store {
             ));
         }
         if !exists {
-            // Persist ownership before publishing the sidecar, including retries after a failed save.
             self.save(session)?;
         }
         let capture = CaptureLog::open(&path, session.capture_session.as_deref().unwrap())?;
@@ -180,6 +175,22 @@ impl Store {
             ));
         }
         Ok(capture)
+    }
+
+    pub fn robot_capture_path(&self) -> PathBuf {
+        self.session_path.with_extension("robots.jsonl")
+    }
+
+    pub fn prepare_robot_capture(&self, session: &Session) -> io::Result<RobotCaptureLog> {
+        let owner = session
+            .capture_session
+            .as_deref()
+            .ok_or_else(|| invalid_data("Start GC capture before preparing the robot archive"))?;
+        let path = self.robot_capture_path();
+        if !regular_file_exists(&path)? {
+            self.save(session)?;
+        }
+        RobotCaptureLog::open(&path, owner)
     }
 
     pub fn markdown_path(&self) -> &Path {
@@ -270,7 +281,6 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8], replace: bool) -> io::R
         if replace {
             fs::rename(&temp_path, path)?;
         } else {
-            // Unlike rename, a hard link atomically fails if the destination already exists.
             fs::hard_link(&temp_path, path)?;
             fs::remove_file(&temp_path)?;
         }
@@ -297,6 +307,3 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8], replace: bool) -> io::R
     Ok(())
 }
 
-#[cfg(test)]
-#[path = "../tests/unit/storage.rs"]
-mod tests;

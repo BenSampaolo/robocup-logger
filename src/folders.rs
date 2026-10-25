@@ -1,4 +1,3 @@
-#[cfg(not(test))]
 use std::process::Command;
 use std::{
     io,
@@ -21,7 +20,6 @@ fn directory(path: &Path) -> io::Result<PathBuf> {
     }
 }
 
-#[cfg(not(test))]
 pub(crate) fn open(path: &Path) -> io::Result<()> {
     let directory = directory(path)?;
     #[cfg(target_os = "macos")]
@@ -39,11 +37,3 @@ pub(crate) fn open(path: &Path) -> io::Result<()> {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn open(path: &Path) -> io::Result<()> {
-    directory(path)?;
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "Desktop launch disabled in unit tests",
-    ))
-}

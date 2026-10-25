@@ -1,4 +1,3 @@
-// GameController v7.0.0-rc.3 config/teams.yaml plus local additions, embedded for portable binaries.
 pub(crate) const TEAMS: &[(u8, &str)] = &[
     (0, "Invisibles"),
     (1, "NUbots"),

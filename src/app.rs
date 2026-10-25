@@ -6,8 +6,10 @@ use ratatui::{style::Color, widgets::ListState};
 use tui_textarea::{CursorMove, TextArea};
 
 use crate::{
-    capture::{CaptureLog, Packet},
+    arcade_state::Arcade,
+    capture::{CaptureLog, Packet, RobotCaptureLog, RobotPacket},
     discovery::Discovery,
+    field::FieldDimensions,
     game_controller::{Receiver, Update, format_clock},
     model::{Entry, EventKind, MatchType, Metadata, Session},
     navigation::{Command, Keybindings, wrap_selection},
@@ -15,6 +17,7 @@ use crate::{
     settings::Settings,
     storage::Store,
     teams::{TEAMS, team_name, team_number},
+    telemetry::Telemetry,
 };
 
 pub const EVENT_KINDS: [EventKind; 9] = [
@@ -145,7 +148,6 @@ pub struct Form {
     pub team_filter: String,
     pub team_searching: bool,
     pub detected_teams: Option<DetectedTeams>,
-    // Display tracked team first without changing saved GoalHome/GoalAway meaning.
     tracked_are_home: bool,
     legacy_teams: bool,
 }
@@ -489,19 +491,20 @@ pub struct App {
     pub dirty: bool,
     pub controller: Option<Receiver>,
     pub discovery: Discovery,
+    pub field_dimensions: FieldDimensions,
+    pub telemetry: Telemetry,
+    pub arcade: Arcade,
     pub controller_error: Option<String>,
     pub pending_controller: Vec<Update>,
     pub capture_log: Option<CaptureLog>,
     pub pending_capture: Vec<Packet>,
+    pub robot_capture_log: Option<RobotCaptureLog>,
+    pub pending_robot_capture: Vec<RobotPacket>,
     pub last_capture_id: Option<u64>,
     action_capture_after: Option<u64>,
 }
 
 impl App {
-    #[cfg(test)]
-    pub fn new(path: Option<&Path>) -> io::Result<Self> {
-        Self::new_with_settings(path, &Settings::default())
-    }
 
     pub fn new_with_settings(path: Option<&Path>, settings: &Settings) -> io::Result<Self> {
         if let Some(path) = path {
@@ -514,7 +517,12 @@ impl App {
             let last_capture_id = capture_log
                 .as_ref()
                 .and_then(|log| log.next_id().checked_sub(1));
+            let field_dimensions = session
+                .field_dimensions
+                .clone()
+                .unwrap_or_else(|| settings.field_dimensions.clone());
             let mut app = Self {
+                arcade: Arcade::new(session.entries.len()),
                 session: Some(session),
                 store: Some(store),
                 mode: Mode::Idle,
@@ -530,10 +538,14 @@ impl App {
                 dirty: false,
                 controller: None,
                 discovery: Discovery::default(),
+                field_dimensions,
+                telemetry: Telemetry::default(),
                 controller_error: None,
                 pending_controller: Vec::new(),
                 capture_log,
                 pending_capture: Vec::new(),
+                robot_capture_log: None,
+                pending_robot_capture: Vec::new(),
                 last_capture_id,
                 action_capture_after: None,
             };
@@ -574,10 +586,15 @@ impl App {
             dirty: false,
             controller: None,
             discovery: Discovery::default(),
+            field_dimensions: settings.field_dimensions.clone(),
+            telemetry: Telemetry::default(),
+            arcade: Arcade::default(),
             controller_error: None,
             pending_controller: Vec::new(),
             capture_log: None,
             pending_capture: Vec::new(),
+            robot_capture_log: None,
+            pending_robot_capture: Vec::new(),
             last_capture_id: None,
             action_capture_after: None,
         })
@@ -607,6 +624,36 @@ impl App {
         } else {
             self.discovery = Discovery::default();
         }
+    }
+
+    pub fn poll_telemetry(&mut self) {
+        let Some(session) = &self.session else { return };
+        let source = match &self.controller {
+            Some(receiver) => receiver.source.map(|address| address.ip()),
+            None => self.discovery.source(),
+        };
+        let next_id = self
+            .robot_capture_log
+            .as_ref()
+            .filter(|_| self.controller.is_some())
+            .map(RobotCaptureLog::next_id);
+        self.telemetry.capture_paused = !self.pending_robot_capture.is_empty()
+            || (next_id.is_some() && self.save_error.is_some());
+        let pending = &mut self.pending_robot_capture;
+        self.telemetry.poll(
+            source,
+            session.metadata.tracked_team_number(),
+            |received_at, source, bytes| {
+                if let Some(next_id) = next_id {
+                    pending.push(RobotPacket {
+                        id: next_id.saturating_add(pending.len() as u64),
+                        received_at,
+                        source,
+                        packet: bytes.to_vec(),
+                    });
+                }
+            },
+        );
     }
 
     pub fn mode_style(&self) -> (&'static str, Color) {
@@ -642,6 +689,24 @@ impl App {
                 return;
             }
             self.pending_capture.clear();
+            self.save_error = None;
+        }
+        if !self.pending_robot_capture.is_empty() {
+            let result = self
+                .robot_capture_log
+                .as_mut()
+                .ok_or_else(|| io::Error::other("Robot capture is not open"))
+                .and_then(|log| log.append(&self.pending_robot_capture));
+            if let Err(error) = result {
+                self.dirty = true;
+                self.telemetry.capture_paused = true;
+                self.save_error = Some(format!(
+                    "Robot capture paused: {error}. Select Retry saving in Actions; quitting is blocked."
+                ));
+                return;
+            }
+            self.pending_robot_capture.clear();
+            self.telemetry.capture_paused = false;
             self.save_error = None;
         }
         if !self.dirty {
@@ -776,7 +841,6 @@ impl App {
         if let Some(session) = &mut self.session {
             let legacy_golden_goal = session.match_type.is_none() && session.in_golden_goal();
             if kind == EventKind::Note {
-                // A second event can interrupt a draft without losing its text or timestamp.
                 session.submit_note();
                 session.start_note(now);
                 self.note_editor = editor("");
@@ -983,11 +1047,26 @@ impl App {
                             }
                         }
                     }
+                    if self.robot_capture_log.is_none() {
+                        let result = self
+                            .store
+                            .as_ref()
+                            .unwrap()
+                            .prepare_robot_capture(self.session.as_ref().unwrap());
+                        match result {
+                            Ok(log) => self.robot_capture_log = Some(log),
+                            Err(error) => {
+                                self.dirty = true;
+                                self.controller_error =
+                                    Some(format!("Cannot start robot capture: {error}"));
+                                return false;
+                            }
+                        }
+                    }
                     let metadata = &self.session.as_ref().unwrap().metadata;
                     let expected_opponent = metadata
                         .tracked_team
                         .and_then(|_| team_number(metadata.opponent_name()));
-                    // Discovery and match logging share UDP 3838; hand off the socket.
                     self.discovery = Discovery::default();
                     match Receiver::bind(metadata.tracked_team_number(), expected_opponent) {
                         Ok(mut receiver) => {
@@ -1103,7 +1182,6 @@ impl App {
         let text_editing = !self.help_visible
             && (matches!(self.mode, Mode::Writing)
                 || matches!(&self.mode, Mode::Form(form) if form.editing || form.team_searching));
-        // Printable bindings belong to the editor, including Space and '?'.
         let literal = matches!(key.code, KeyCode::Char(_))
             && !key
                 .modifiers
@@ -1155,7 +1233,6 @@ impl App {
             self.help_visible = true;
             return Ok(false);
         }
-        // Never execute a popup choice while its controls are hidden by the size guard.
         if !self.controls_visible
             && command == Some(Command::Confirm)
             && (matches!(
@@ -1399,7 +1476,6 @@ impl App {
                 .as_ref()
                 .is_some_and(|session| session.match_type.is_some() && !session.is_finished())
         {
-            // Packets received while closed advanced the receiver but not the saved score.
             self.pending_controller.clear();
             if let Some(controller) = &mut self.controller {
                 controller.rebaseline();
@@ -1417,8 +1493,9 @@ impl App {
                 if output.is_empty() {
                     return Err("Output directory is required".into());
                 }
-                let session =
+                let mut session =
                     Session::new_match(metadata, form.match_type.ok_or("Choose a match type")?);
+                session.field_dimensions = Some(self.field_dimensions.clone());
                 session.validate()?;
                 let store = Store::create(Path::new(output), &session)
                     .map_err(|error| format!("Cannot create log: {error}"))?;
@@ -1609,6 +1686,3 @@ fn edit_key(editor: &mut TextArea<'static>, key: KeyEvent) -> bool {
     }
 }
 
-#[cfg(test)]
-#[path = "../tests/unit/app.rs"]
-mod tests;

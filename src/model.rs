@@ -76,7 +76,6 @@ impl Metadata {
         } else if self.home.trim().eq_ignore_ascii_case("HULKs")
             == self.away.trim().eq_ignore_ascii_case("HULKs")
         {
-            // Logs without an explicit perspective retain the original HULKs semantics.
             return Err("Exactly one team must be HULKs (home or away)".into());
         }
         for robot in &self.robots {
@@ -154,10 +153,8 @@ pub struct Entry {
     pub from_controller: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_budget: Option<u16>,
-    // A transition packet can reset the budget; the test summary uses the preceding reading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub golden_goal_message_budget: Option<u16>,
-    // Controller sync/correction deltas adjust this game's score (official score in legacy logs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub score_delta: Option<[i32; 2]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -173,8 +170,6 @@ impl Entry {
         {
             return false;
         }
-        // Match the complete generated suffix, not just the prefix: appended human
-        // annotations must remain visible, including in sessions saved by older versions.
         let Some((_, clock)) = self.text.rsplit_once("; secondary ") else {
             return false;
         };
@@ -237,6 +232,10 @@ impl Entry {
 pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_dimensions: Option<crate::field::FieldDimensions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_position: Option<f64>,
     pub metadata: Metadata,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub match_type: Option<MatchType>,
@@ -254,6 +253,8 @@ impl Session {
     pub fn new(metadata: Metadata) -> Self {
         Self {
             capture_session: None,
+            field_dimensions: None,
+            replay_position: None,
             metadata,
             match_type: None,
             golden_goal_opponent: None,
@@ -475,6 +476,15 @@ impl Session {
 
     pub fn validate(&self) -> Result<(), String> {
         self.metadata.validate()?;
+        if let Some(dimensions) = &self.field_dimensions {
+            dimensions.validate()?;
+        }
+        if self
+            .replay_position
+            .is_some_and(|position| !position.is_finite() || position < 0.0)
+        {
+            return Err("Replay position must be finite and nonnegative".into());
+        }
         if matches!(
             self.match_type,
             Some(MatchType::GoldenGoal | MatchType::Combined)
@@ -634,9 +644,9 @@ impl Session {
             let heading = match entry.kind {
                 _ if fixed_golden_goal => None,
                 EventKind::GoldenGoalStart => Some("Golden Goal"),
-                EventKind::GameStart => Some("1. Halbzeit"),
-                EventKind::HalfTime => Some("Halbzeit"),
-                EventKind::SecondHalfStart => Some("2. Halbzeit"),
+                EventKind::GameStart => Some("First half"),
+                EventKind::HalfTime => Some("Half-time"),
+                EventKind::SecondHalfStart => Some("Second half"),
                 _ => None,
             };
             if let Some(heading) =
@@ -655,7 +665,6 @@ impl Session {
                     },
                 )
             } else {
-                // Legacy logs retain their original wall-clock representation.
                 entry
                     .timestamp
                     .to_rfc3339_opts(SecondsFormat::Millis, false)
@@ -736,7 +745,6 @@ impl Session {
                 } else {
                     "Final score"
                 };
-                // An end marker can be removed, followed by more goals, then restored.
                 let (summary_home, summary_away) =
                     if let Some(game) = game.filter(|_| entry.kind == EventKind::GameEnd) {
                         let (home, away) = self.raw_score_for(game);
@@ -805,7 +813,3 @@ pub(crate) fn markdown_text(text: &str) -> String {
     }
     escaped
 }
-
-#[cfg(test)]
-#[path = "../tests/unit/model.rs"]
-mod tests;

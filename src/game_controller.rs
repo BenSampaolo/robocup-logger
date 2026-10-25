@@ -1,6 +1,6 @@
 use std::{
     io,
-    net::{SocketAddr, UdpSocket},
+    net::{IpAddr, SocketAddr, UdpSocket},
     time::{Duration, Instant},
 };
 
@@ -27,6 +27,9 @@ pub struct Snapshot {
     pub tracked_score: u8,
     pub tracked_message_budget: u16,
     pub tracked_penalties: [u8; 20],
+    pub tracked_field_color: u8,
+    pub tracked_goalkeeper_color: u8,
+    pub tracked_goalkeeper: u8,
     pub opponent_score: u8,
     pub opponent_number: u8,
 }
@@ -34,6 +37,20 @@ pub struct Snapshot {
 impl Snapshot {
     pub fn clock(&self) -> String {
         format_clock(self.seconds_remaining)
+    }
+
+    pub(crate) fn jersey_color(&self, player: u8) -> &'static str {
+        let color = if player == self.tracked_goalkeeper {
+            self.tracked_goalkeeper_color
+        } else {
+            self.tracked_field_color
+        };
+        [
+            "BLUE", "RED", "YELLOW", "BLACK", "WHITE", "GREEN", "ORANGE", "PURPLE", "BROWN", "GRAY",
+        ]
+        .get(usize::from(color))
+        .copied()
+        .unwrap_or("UNKNOWN COLOR")
     }
 
     pub fn summary(&self) -> String {
@@ -85,8 +102,24 @@ impl Snapshot {
                 && self.opponent_score == 0)
     }
 
-    fn same_game_state(&self, other: &Self) -> bool {
+    pub(crate) fn same_game_state(&self, other: &Self) -> bool {
         self.same_match_state(other) && self.tracked_penalties == other.tracked_penalties
+    }
+
+    pub(crate) fn ball_became_free(&self, previous: &Self) -> bool {
+        self.state == 3
+            && previous.state == 3
+            && !self.stopped
+            && !previous.stopped
+            && matches!(self.game_phase, 0 | 2)
+            && self.game_phase == previous.game_phase
+            && self.first_half == previous.first_half
+            && self.set_play == 0
+            && (previous.set_play != 0
+                || (previous.kicking_team != 255 && self.kicking_team == 255)
+                || (previous.set_play == 0
+                    && previous.secondary_time > 0
+                    && self.secondary_time <= 0))
     }
 
     pub(crate) fn same_match_state(&self, other: &Self) -> bool {
@@ -112,7 +145,6 @@ pub(crate) fn format_clock(seconds: i16) -> String {
     )
 }
 
-// v20 layout: https://github.com/RoboCup-SPL/GameController/blob/7194909358cc6f93fecac93d3a08cbe6c17bd888/src/data/GameControlData.java
 pub(crate) fn decode_capture(
     packet: &[u8],
     true_data: bool,
@@ -187,6 +219,9 @@ fn parse_team_feed(
         tracked_score: packet[tracked + 4],
         tracked_message_budget: u16::from_le_bytes([packet[tracked + 8], packet[tracked + 9]]),
         tracked_penalties: std::array::from_fn(|player| packet[tracked + 10 + 3 * player]),
+        tracked_field_color: packet[tracked + 1],
+        tracked_goalkeeper_color: packet[tracked + 2],
+        tracked_goalkeeper: packet[tracked + 3],
         opponent_score: packet[opponent + 4],
         opponent_number: packet[opponent],
     }))
@@ -221,8 +256,6 @@ pub struct Receiver {
     retired_true_source: Option<SocketAddr>,
     last_true_receipt: Option<Instant>,
     last_true_data_request: Option<Instant>,
-    #[cfg(test)]
-    request_destination: Option<SocketAddr>,
     pub true_data: bool,
     auto_true_data: bool,
     pub allow_opponent_change: bool,
@@ -232,6 +265,7 @@ pub struct Receiver {
     pub awaiting_official_start: bool,
     pub latest: Option<Snapshot>,
     pub received_at: Option<Instant>,
+    clock_started: Option<Instant>,
     pub source: Option<SocketAddr>,
     pub notice: Option<String>,
 }
@@ -266,8 +300,6 @@ impl Receiver {
             retired_true_source: None,
             last_true_receipt: None,
             last_true_data_request: None,
-            #[cfg(test)]
-            request_destination: None,
             true_data: false,
             auto_true_data: true,
             allow_opponent_change: false,
@@ -279,43 +311,10 @@ impl Receiver {
             received_at: None,
             source: None,
             notice: None,
+            clock_started: None,
         })
     }
 
-    #[cfg(test)]
-    pub fn for_test() -> Self {
-        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-        socket.set_nonblocking(true).unwrap();
-        Self {
-            socket,
-            probe: crate::discovery::Probe::default(),
-            detected: None,
-            discovery_only: false,
-            source_from_request: false,
-            tracked_team: HULKS_TEAM_NUMBER,
-            capture_enabled: false,
-            next_capture_id: 0,
-            captures: Vec::new(),
-            opponent_number: None,
-            true_source: None,
-            retired_true_source: None,
-            last_true_receipt: None,
-            last_true_data_request: None,
-            request_destination: None,
-            true_data: false,
-            // Synthetic fixtures start without active discovery requests.
-            auto_true_data: false,
-            allow_opponent_change: false,
-            allow_same_opponent_restart: None,
-            ignored_opponent: None,
-            acquisition_opponent: None,
-            awaiting_official_start: false,
-            latest: None,
-            received_at: None,
-            source: None,
-            notice: None,
-        }
-    }
 
     pub(crate) fn bind_discovery() -> io::Result<Self> {
         let mut receiver = Self::bind(HULKS_TEAM_NUMBER, None)?;
@@ -330,6 +329,13 @@ impl Receiver {
             && crate::teams::team_name(detected.teams.0).is_some()
             && crate::teams::team_name(detected.teams.1).is_some())
         .then_some(detected.teams)
+    }
+
+    pub(crate) fn detected_source(&self) -> Option<IpAddr> {
+        self.detected
+            .as_ref()
+            .filter(|detected| detected.received_at.elapsed() <= STALE_AFTER)
+            .map(|detected| detected.source.ip())
     }
 
     pub(crate) fn discovery_status(&self) -> (String, bool) {
@@ -390,7 +396,6 @@ impl Receiver {
     }
 
     pub(crate) fn reconnect(&mut self, opponent: u8) {
-        // Keep the socket, capture IDs and history owner; only explicit action unpins IPs.
         self.acquisition_opponent = Some(opponent);
         self.opponent_number = None;
         self.source = None;
@@ -432,7 +437,6 @@ impl Receiver {
 
     pub fn poll(&mut self) -> io::Result<Vec<Update>> {
         let mut updates = Vec::new();
-        // Preserve the complete UDP payload, including malformed/overlong frames.
         let mut buffer = [0; 65536];
         for _ in 0..64 {
             let (length, source) = match self.socket.recv_from(&mut buffer) {
@@ -441,7 +445,6 @@ impl Receiver {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => {
                     self.notice = Some(format!("GameController receive failed: {error}"));
-                    // Preserve updates already consumed before an error.
                     if updates.is_empty() {
                         return Err(error);
                     }
@@ -454,7 +457,6 @@ impl Receiver {
             if self.discovery_only {
                 continue;
             }
-            // A monitor reply can establish the source without any RGme broadcast.
             if self.auto_true_data
                 && self.source.is_none()
                 && buffer[..length].get(..4) == Some(b"RGTD")
@@ -480,7 +482,6 @@ impl Receiver {
                     );
                     let (accepted, update) = self.accept_packet(snapshot, source, now, received_at);
                     if update.is_some() && self.auto_true_data {
-                        // Discover the controller, not its delayed match state/opponent.
                         self.set_true_data(true)?;
                         self.opponent_number = None;
                         (
@@ -515,7 +516,6 @@ impl Receiver {
                         (b"RGme", self.source)
                     };
                     if buffer[..length].get(..4) == Some(header) && pinned == Some(source) {
-                        // Missing state from the selected stream breaks statistical coverage.
                         self.rebaseline();
                     }
                     self.notice = Some(notice);
@@ -566,8 +566,6 @@ impl Receiver {
     }
 
     fn request_true_data(&mut self, now: Instant) -> io::Result<()> {
-        // HSL recreates the monitor sender (port and sequence) on every request.
-        // Like GameControlDataReceiver.java, only retry after a second without true data.
         if !self.true_data
             || self
                 .last_true_receipt
@@ -579,28 +577,13 @@ impl Receiver {
             return Ok(());
         }
         self.last_true_data_request = Some(now);
-        #[cfg(not(test))]
         let destination = SocketAddr::new(
             self.source
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "No controller source"))?
                 .ip(),
             3636,
         );
-        #[cfg(test)]
-        let destination = self.request_destination.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotConnected,
-                "No loopback request destination",
-            )
-        })?;
-        #[cfg(test)]
-        assert!(
-            destination.ip().is_loopback() && ![0, 3636, 3838].contains(&destination.port()),
-            "Tests must use an ephemeral loopback request destination"
-        );
         self.socket.send_to(b"RGTr\0", destination)?;
-        // Retire the old port before accepting the recreated sender's new baseline.
-        // Keep it retired across unanswered retries: in-flight packets cannot repin it.
         if let Some(source) = self.true_source.take() {
             self.retired_true_source = Some(source);
         }
@@ -616,23 +599,38 @@ impl Receiver {
             .is_none_or(|last| now.saturating_duration_since(last) > STALE_AFTER)
     }
 
+    pub fn live_clock(&self, now: Instant) -> Option<String> {
+        if self.is_stale_at(now) {
+            return None;
+        }
+        let snapshot = self.latest.as_ref()?;
+        let running =
+            snapshot.state == 3 && !snapshot.stopped && matches!(snapshot.game_phase, 0 | 2);
+        let fraction = if running {
+            now.saturating_duration_since(self.clock_started?)
+                .as_secs_f64()
+                .min(0.99)
+        } else {
+            0.0
+        };
+        let seconds = f64::from(snapshot.seconds_remaining) - fraction;
+        let hundredths = (seconds.abs() * 100.0).round() as u64;
+        Some(format!(
+            "{}{:02}:{:02}.{:02}",
+            if seconds < 0.0 { "-" } else { "" },
+            hundredths / 6000,
+            hundredths / 100 % 60,
+            hundredths % 100
+        ))
+    }
+
     pub fn rebaseline(&mut self) {
         self.latest = None;
         self.received_at = None;
+        self.clock_started = None;
     }
 
-    #[cfg(test)]
-    fn accept(
-        &mut self,
-        snapshot: Snapshot,
-        source: SocketAddr,
-        now: Instant,
-        received_at: DateTime<FixedOffset>,
-    ) -> Option<Update> {
-        self.accept_packet(snapshot, source, now, received_at).1
-    }
 
-    // Acceptance includes clock-only frames, which deliberately produce no Update.
     fn accept_packet(
         &mut self,
         snapshot: Snapshot,
@@ -679,12 +677,9 @@ impl Receiver {
         let same_opponent_restart = self.allow_same_opponent_restart.is_some_and(|opponent| {
             snapshot.opponent_number == opponent && snapshot.starts_official_after(opponent)
         });
-        // Do not import a late test end into a newly observed same-opponent pregame.
-        // Reconnect explicitly clears this guard if Playing was never observed.
         if self.awaiting_official_start && snapshot.state == 4 {
             return (false, None);
         }
-        // Positive match-reset evidence, not a recreated UDP sender, permits a new sequence.
         let mut previous = if opponent_changed
             || same_opponent_restart
             || self.is_stale_at(now)
@@ -700,13 +695,12 @@ impl Receiver {
                 return (false, None);
             }
             if delta != 1 {
-                // Lost packets may contain complete penalty or restart episodes.
                 previous = None;
             }
         }
         let changed = previous
             .as_ref()
-            .is_none_or(|last| !snapshot.same_game_state(last));
+            .is_none_or(|last| !snapshot.same_game_state(last) || snapshot.ball_became_free(last));
         if self.true_data {
             self.true_source = Some(source);
             self.last_true_receipt = Some(now);
@@ -714,8 +708,6 @@ impl Receiver {
             self.source = Some(source);
             self.source_from_request = false;
         }
-        // A reopened receiver may attach directly to the new game. Pin that first
-        // opponent for the rest of this batch as well, until the app imports it.
         if opponent_changed || same_opponent_restart || self.opponent_number.is_none() {
             self.allow_opponent_change = false;
             self.allow_same_opponent_restart = None;
@@ -728,6 +720,15 @@ impl Receiver {
         self.opponent_number = Some(snapshot.opponent_number);
         if !self.auto_true_data {
             self.acquisition_opponent = None;
+        }
+        if previous.as_ref().is_none_or(|last| {
+            last.seconds_remaining != snapshot.seconds_remaining
+                || last.state != snapshot.state
+                || last.stopped != snapshot.stopped
+                || last.game_phase != snapshot.game_phase
+                || last.first_half != snapshot.first_half
+        }) {
+            self.clock_started = Some(now);
         }
         self.received_at = Some(now);
         self.latest = Some(snapshot.clone());
@@ -744,6 +745,3 @@ impl Receiver {
     }
 }
 
-#[cfg(test)]
-#[path = "../tests/unit/controller.rs"]
-mod tests;

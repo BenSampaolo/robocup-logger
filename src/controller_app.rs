@@ -79,7 +79,6 @@ impl App {
                     }
                     context
                 };
-                // The menu delays history imports, not receipt-time game boundaries.
                 for update in self.pending_controller.iter().take(previously_pending) {
                     capture_context(Some(&update.snapshot));
                 }
@@ -103,7 +102,6 @@ impl App {
             }
             self.pending_capture.extend(captures);
         }
-        // Opening Actions captured an earlier moment: apply its event before later controller events.
         if !matches!(self.mode, Mode::Actions { .. }) {
             self.flush_controller();
         }
@@ -148,6 +146,14 @@ impl App {
         {
             return;
         }
+        let previous = if transitioning {
+            None
+        } else {
+            update.previous.as_ref()
+        };
+        let animation_time = std::time::Instant::now();
+        self.arcade
+            .observe_controller(session, previous, snapshot, animation_time);
         if session.match_type.is_some() && session.is_finished() && !transitioning {
             return;
         }
@@ -158,14 +164,10 @@ impl App {
         };
         let fixed_golden_goal = session.match_type == Some(MatchType::GoldenGoal)
             || (combined && target_game == MatchType::GoldenGoal);
-        let previous = if transitioning {
-            None
-        } else {
-            update.previous.as_ref()
-        };
-        if target_game == MatchType::GoldenGoal
-            && previous.is_some_and(|packet| snapshot.same_match_state(packet))
-        {
+        if previous.is_some_and(|packet| {
+            snapshot.same_game_state(packet)
+                || (target_game == MatchType::GoldenGoal && snapshot.same_match_state(packet))
+        }) {
             return;
         }
         let golden_goal_message_budget = if session.match_type.is_none() && session.in_golden_goal()
@@ -228,7 +230,6 @@ impl App {
         } else {
             None
         };
-        // A reported official goal must not be attributed to an unfinished deployment test.
         if phase.is_none()
             && session.match_type.is_none()
             && official
@@ -284,7 +285,6 @@ impl App {
         let statistics = (matches!(snapshot.game_phase, 0 | 2 | 3)
             && (target_game == MatchType::Official || leaving_legacy_test))
             .then(|| {
-                // A test/phase/source handoff supplies a baseline, not observed events.
                 let previous = previous.filter(|packet| {
                     !leaving_legacy_test
                         && matches!(packet.game_phase, 0 | 2 | 3)
@@ -388,6 +388,7 @@ impl App {
                 .text
                 .push_str("; phase observed on attachment, not the original transition time");
         }
+        self.arcade.observe(session, animation_time);
         self.dirty = true;
         if follow {
             self.history.select(Some(session.entries.len() - 1));

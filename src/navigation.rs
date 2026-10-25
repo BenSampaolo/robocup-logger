@@ -231,7 +231,6 @@ fn normalize(mut code: KeyCode, mut modifiers: KeyModifiers) -> (KeyCode, KeyMod
         } else if modifiers.contains(KeyModifiers::SHIFT) {
             code = KeyCode::Char(character.to_ascii_uppercase());
         }
-        // Terminals disagree about reporting Shift for already-shifted printable characters.
         modifiers.remove(KeyModifiers::SHIFT);
     } else if code == KeyCode::BackTab {
         code = KeyCode::Tab;

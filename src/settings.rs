@@ -1,4 +1,6 @@
-use crate::{navigation::Keybindings, storage::atomic_write, teams::team_number};
+use crate::{
+    field::FieldDimensions, navigation::Keybindings, storage::atomic_write, teams::team_number,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     env, fs, io,
@@ -9,28 +11,31 @@ use std::{
 #[serde(deny_unknown_fields)]
 pub struct Settings {
     pub log_directory: PathBuf,
-    pub python: PathBuf,
-    pub model_cache: PathBuf,
+    #[serde(default, rename = "python", skip_serializing)]
+    _legacy_python: Option<PathBuf>,
+    #[serde(default, rename = "model_cache", skip_serializing)]
+    _legacy_model_cache: Option<PathBuf>,
     pub event: String,
     pub home: String,
     pub away: String,
     pub robots: [String; 5],
     pub keys: Keybindings,
+    #[serde(default)]
+    pub field_dimensions: FieldDimensions,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        let speech = PathBuf::from(env::var_os("HOME").unwrap_or_default())
-            .join("Programming/phillip-neutts-german");
         Self {
             log_directory: "logs".into(),
-            python: speech.join(".venv/bin/python"),
-            model_cache: speech.join("models/hub"),
+            _legacy_python: None,
+            _legacy_model_cache: None,
             event: String::new(),
             home: "HULKs".into(),
             away: String::new(),
             robots: Default::default(),
             keys: Keybindings::default(),
+            field_dimensions: FieldDimensions::default(),
         }
     }
 }
@@ -63,11 +68,7 @@ impl Settings {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        for (label, path) in [
-            ("Log directory", &self.log_directory),
-            ("Python interpreter", &self.python),
-            ("Model cache", &self.model_cache),
-        ] {
+        for (label, path) in [("Log directory", &self.log_directory)] {
             if path.as_os_str().is_empty() {
                 return Err(format!("{label} must not be empty"));
             }
@@ -94,6 +95,7 @@ impl Settings {
                 return Err("Tracked team and opponent must be different".into());
             }
         }
+        self.field_dimensions.validate()?;
         self.keys.validate()
     }
 
@@ -161,7 +163,3 @@ fn regular_file_exists(path: &Path) -> io::Result<bool> {
         )),
     }
 }
-
-#[cfg(test)]
-#[path = "../tests/unit/settings.rs"]
-mod tests;

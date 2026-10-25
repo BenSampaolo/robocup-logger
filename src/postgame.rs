@@ -1,10 +1,15 @@
-use std::{fmt::Write as _, io, process::Command as ProcessCommand, time::Duration};
+use std::{
+    fmt::Write as _,
+    io,
+    process::Command as ProcessCommand,
+    time::{Duration, Instant},
+};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame, Terminal,
     backend::Backend,
-    layout::{Constraint, Layout, Rect},
+    layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, List, ListItem, ListState, Padding, Paragraph, Wrap},
@@ -12,9 +17,7 @@ use ratatui::{
 use tui_textarea::TextArea;
 
 use crate::{
-    audio::Audio,
     game_controller::format_clock,
-    meeting::NoteSnapshot,
     model::{Entry, EventKind, MatchType, PostgameNote, Session},
     navigation::{Command, Keybindings, wrap_selection},
     presentation::{ACCENT, ERROR, FOCUS, MUTED, SUCCESS, popup, solid_panel},
@@ -43,12 +46,10 @@ struct Edit {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Menu {
-    RecordingChoice,
     Actions,
     FinishWithTabs,
     FinishWithoutTabs,
     DiscardDetails,
-    CancelTranscription,
 }
 
 pub struct Postgame {
@@ -64,18 +65,11 @@ pub struct Postgame {
     keys: Keybindings,
     dirty: bool,
     error: Option<String>,
-    audio: Audio,
-    transcript: Option<crate::transcript_viewer::Viewer>,
-    exit_links: Option<Vec<String>>,
     layout_ready: bool,
+    replay: Option<crate::replay::Replay>,
 }
 
 impl Postgame {
-    #[cfg(test)]
-    pub fn new(session: Session) -> Self {
-        Self::new_with_settings(session, &Settings::default())
-    }
-
     fn new_with_settings(session: Session, settings: &Settings) -> Self {
         let entries: Vec<usize> = session
             .entries
@@ -108,23 +102,86 @@ impl Postgame {
             scroll: 0,
             edit: None,
             jump: None,
-            menu: Some(Menu::RecordingChoice),
+            menu: None,
             menu_selected: 0,
             help: false,
             keys: settings.keys.clone(),
             dirty: false,
             error: None,
-            audio: Audio::with_settings(settings),
-            transcript: None,
-            exit_links: None,
             layout_ready: true,
+            replay: None,
+        }
+    }
+
+    fn new_replay_with_settings(
+        session: Session,
+        settings: &Settings,
+        store: &Store,
+    ) -> io::Result<Self> {
+        let replay = crate::replay::Replay::load(store, &session)?;
+        let mut app = Self::new_with_settings(session, settings);
+        app.entries = replay.note_entries();
+        app.selected = replay
+            .current_entry()
+            .and_then(|index| app.entries.iter().position(|&entry| entry == index))
+            .unwrap_or(0);
+        app.replay = Some(replay);
+        Ok(app)
+    }
+
+    fn current_index(&self) -> Option<usize> {
+        match &self.replay {
+            Some(replay) => replay.current_entry(),
+            None => self.entries.get(self.selected).copied(),
         }
     }
 
     fn current(&self) -> Option<&Entry> {
-        self.entries
-            .get(self.selected)
-            .map(|&index| &self.session.entries[index])
+        self.current_index()
+            .and_then(|index| self.session.entries.get(index))
+    }
+
+    fn sync_replay(&mut self, previous: Option<usize>, store: &Store) {
+        let Some(replay) = &self.replay else { return };
+        let (current, time, paused) = (replay.current_entry(), replay.time, replay.paused);
+        if current != previous {
+            if let Some(index) = current {
+                if let Some(position) = self.entries.iter().position(|&entry| entry == index) {
+                    self.selected = position;
+                }
+                if self.session.postgame_position != Some(index) {
+                    self.session.postgame_position = Some(index);
+                    self.dirty = true;
+                }
+            }
+        }
+        if (paused || current != previous) && self.session.replay_position != Some(time) {
+            self.session.replay_position = Some(time);
+            self.dirty = true;
+        }
+        self.save(store);
+    }
+
+    fn tick_replay(&mut self, elapsed: Duration, store: &Store) {
+        if self.replay.is_none() {
+            return;
+        }
+        if self.menu.is_some()
+            || self.edit.is_some()
+            || self.jump.is_some()
+            || self.help
+            || !self.layout_ready
+            || (self.dirty && self.error.is_some())
+        {
+            self.replay.as_mut().unwrap().paused = true;
+            return;
+        }
+        let previous = self.current_index();
+        self.replay
+            .as_mut()
+            .unwrap()
+            .advance(elapsed, Instant::now(), &self.session);
+        self.sync_replay(previous, store);
     }
 
     fn save(&mut self, store: &Store) -> bool {
@@ -147,10 +204,15 @@ impl Postgame {
     }
 
     fn links(&self) -> Vec<String> {
-        self.entries
+        self.session
+            .entries
             .iter()
-            .filter_map(|&index| {
-                let entry = &self.session.entries[index];
+            .enumerate()
+            .filter(|(index, entry)| {
+                !entry.undone
+                    && (self.replay.is_some() || self.entries.binary_search(index).is_ok())
+            })
+            .filter_map(|(_, entry)| {
                 entry
                     .postgame
                     .as_ref()
@@ -160,20 +222,17 @@ impl Postgame {
             .collect()
     }
 
-    fn snapshot(&self) -> Option<NoteSnapshot> {
-        self.entries.get(self.selected).map(|&index| {
-            NoteSnapshot::from_entry(index, &self.session.entries[index], &self.session)
-        })
-    }
-
     fn select(&mut self, selected: usize, store: &Store) {
         let Some(&index) = self.entries.get(selected) else {
             return;
         };
-        if self.selected != selected {
-            self.selected = selected;
-            self.audio.mark(self.snapshot());
+        if self.replay.is_some() {
+            let previous = self.current_index();
+            self.replay.as_mut().unwrap().seek_entry(index);
+            self.sync_replay(previous, store);
+            return;
         }
+        self.selected = selected;
         self.scroll = 0;
         if self.session.postgame_position != Some(index) {
             self.session.postgame_position = Some(index);
@@ -202,32 +261,7 @@ impl Postgame {
     }
 
     fn request_exit(&mut self, store: &Store, links: Vec<String>) -> Option<Vec<String>> {
-        if !self.save(store) {
-            return None;
-        }
-        if self.audio.busy() {
-            self.audio.finish();
-            self.exit_links = Some(links);
-            None
-        } else {
-            Some(links)
-        }
-    }
-
-    fn poll_audio(&mut self, store: &Store) -> Option<Vec<String>> {
-        self.audio.poll(store);
-        if self.exit_links.is_some()
-            && !self.audio.busy()
-            && self.menu != Some(Menu::CancelTranscription)
-        {
-            if self.audio.error.is_some() {
-                self.exit_links = None;
-                self.menu = None;
-            } else {
-                return self.exit_links.take();
-            }
-        }
-        None
+        self.save(store).then_some(links)
     }
 
     fn cancel_details(&mut self) {
@@ -245,17 +279,15 @@ impl Postgame {
     }
 
     fn open_menu(&mut self, menu: Menu) {
+        if let Some(replay) = &mut self.replay {
+            replay.paused = true;
+        }
         self.menu = Some(menu);
         self.menu_selected = 0;
     }
 
     fn menu_items(&self, menu: Menu) -> Vec<&'static str> {
         match menu {
-            Menu::RecordingChoice => vec![
-                "Continue without recording",
-                "Everyone consented—record meeting",
-                "Back / exit",
-            ],
             Menu::Actions => vec![
                 if self.current().is_some_and(|entry| {
                     entry.postgame.as_ref().is_some_and(|note| note.actionable)
@@ -265,8 +297,6 @@ impl Postgame {
                     "Mark task"
                 },
                 "Edit details",
-                "View transcript",
-                "Retry transcription",
                 "Jump to note",
                 "Open log folder",
                 "Back to presentation",
@@ -276,7 +306,6 @@ impl Postgame {
             Menu::FinishWithTabs => vec!["Cancel", "Finish and open GitHub tabs"],
             Menu::FinishWithoutTabs => vec!["Cancel", "Finish meeting"],
             Menu::DiscardDetails => vec!["Cancel", "Discard changes"],
-            Menu::CancelTranscription => vec!["Keep waiting", "Cancel transcription and stay"],
         }
     }
 
@@ -289,17 +318,6 @@ impl Postgame {
                     self.error = None;
                 }
             }
-            Menu::CancelTranscription => {
-                if self.menu_selected == 1 {
-                    self.exit_links = None;
-                    self.audio.cancel_transcription();
-                }
-            }
-            Menu::RecordingChoice => match self.menu_selected {
-                1 => self.audio.start(store, &self.session, self.snapshot()),
-                2 => return Some(Vec::new()),
-                _ => {}
-            },
             Menu::FinishWithTabs | Menu::FinishWithoutTabs => {
                 if self.menu_selected == 1 {
                     let links = if menu == Menu::FinishWithTabs {
@@ -312,7 +330,7 @@ impl Postgame {
             }
             Menu::Actions => match self.menu_selected {
                 0 => {
-                    if let Some(&index) = self.entries.get(self.selected) {
+                    if let Some(index) = self.current_index() {
                         let note = self.session.entries[index]
                             .postgame
                             .get_or_insert_with(PostgameNote::default);
@@ -341,25 +359,9 @@ impl Postgame {
                         });
                     }
                 }
-                2 => match self
-                    .audio
-                    .latest_directory(store)
-                    .and_then(|directory| crate::transcript_viewer::Viewer::load(&directory))
-                {
-                    Ok(transcript) => {
-                        self.transcript = Some(transcript);
-                        self.scroll = 0;
-                    }
-                    Err(error) => {
-                        self.audio.error = Some(format!(
-                            "Cannot read transcript: {error}. Choose Retry transcription for the latest recording."
-                        ));
-                    }
-                },
-                3 => self.audio.retry_transcription(store),
-                7 => self.open_menu(Menu::FinishWithTabs),
-                8 => self.open_menu(Menu::FinishWithoutTabs),
-                4 => {
+                5 => self.open_menu(Menu::FinishWithTabs),
+                6 => self.open_menu(Menu::FinishWithoutTabs),
+                2 => {
                     let mut query = TextArea::default();
                     query.set_style(Style::default().fg(FOCUS).bg(Color::Black));
                     query.set_cursor_style(Style::default().fg(Color::Black).bg(ACCENT));
@@ -368,7 +370,7 @@ impl Postgame {
                         selected: self.selected,
                     });
                 }
-                5 => {
+                3 => {
                     if let Err(error) = crate::folders::open(store.session_path()) {
                         self.error = Some(format!("Cannot open log folder: {error}"));
                     }
@@ -387,24 +389,17 @@ impl Postgame {
         if matches!(key.code, KeyCode::Char('c' | 'C'))
             && key.modifiers.contains(KeyModifiers::CONTROL)
         {
-            if self.exit_links.is_some() {
-                self.help = false;
-                self.open_menu(Menu::CancelTranscription);
-            } else if let Some(edit) = &mut self.edit {
+            if let Some(edit) = &mut self.edit {
                 edit.typing = false;
                 self.error =
                     Some("Apply or cancel the details draft before ending the meeting.".into());
-            } else if self.menu == Some(Menu::RecordingChoice) {
-                return Some(Vec::new());
             } else {
                 self.help = false;
-                self.transcript = None;
                 self.jump = None;
                 self.open_menu(Menu::FinishWithoutTabs);
             }
             return None;
         }
-        // Text input owns letters, spaces, and Enter, regardless of menu bindings.
         if let Some(edit) = &mut self.edit
             && edit.typing
         {
@@ -443,12 +438,6 @@ impl Postgame {
             return None;
         }
         let command = self.keys.command(key);
-        if self.exit_links.is_some() && self.menu != Some(Menu::CancelTranscription) {
-            if command == Some(Command::Back) {
-                self.open_menu(Menu::CancelTranscription);
-            }
-            return None;
-        }
         if self.help {
             if matches!(command, Some(Command::Back | Command::Help)) {
                 self.help = false;
@@ -456,17 +445,13 @@ impl Postgame {
             return None;
         }
         if command == Some(Command::Help) {
+            if let Some(replay) = &mut self.replay {
+                replay.paused = true;
+            }
             self.help = true;
             return None;
         }
         if !self.layout_ready && command == Some(Command::Confirm) {
-            return None;
-        }
-        if let Some(transcript) = &mut self.transcript {
-            if transcript.key(key, &self.keys) {
-                self.transcript = None;
-                self.scroll = 0;
-            }
             return None;
         }
         if let Some(menu) = self.menu {
@@ -481,18 +466,9 @@ impl Postgame {
                 }
                 Some(Command::Back) => {
                     self.menu = None;
-                    if menu == Menu::RecordingChoice {
-                        return Some(Vec::new());
-                    }
                 }
                 Some(Command::Confirm) => return self.activate_menu(menu, store),
                 _ => {}
-            }
-            return None;
-        }
-        if self.audio.starting_recording() {
-            if command == Some(Command::Back) {
-                self.open_menu(Menu::FinishWithoutTabs);
             }
             return None;
         }
@@ -508,7 +484,10 @@ impl Postgame {
                 Some(Command::Confirm) if edit.selected == FIELD_NAMES.len() => {
                     let values = edit.fields.each_ref().map(|field| field.lines().join("\n"));
                     let [title, robots, owner, discussion] = values;
-                    let entry = &mut self.session.entries[self.entries[self.selected]];
+                    let Some(index) = self.current_index() else {
+                        return None;
+                    };
+                    let entry = &mut self.session.entries[index];
                     let note = entry.postgame.get_or_insert_with(PostgameNote::default);
                     note.title = title;
                     note.robots = robots;
@@ -520,6 +499,40 @@ impl Postgame {
                 }
                 Some(Command::Back | Command::Confirm) => self.cancel_details(),
                 _ => {}
+            }
+            return None;
+        }
+        if self.replay.is_some() {
+            let previous = self.current_index();
+            if self.replay.as_mut().unwrap().key(key, &self.session) {
+                self.sync_replay(previous, store);
+                return None;
+            }
+            match key.code {
+                KeyCode::Esc => self.open_menu(Menu::Actions),
+                KeyCode::Char('q' | 'Q') => self.open_menu(Menu::FinishWithoutTabs),
+                KeyCode::Char('e' | 'E' | 'a' | 'A') => {
+                    self.replay.as_mut().unwrap().paused = true;
+                    self.menu_selected = usize::from(matches!(key.code, KeyCode::Char('e' | 'E')));
+                    return self.activate_menu(Menu::Actions, store);
+                }
+                _ => match command {
+                    Some(Command::Up | Command::Down | Command::Left | Command::Right) => {
+                        let code = match command.unwrap() {
+                            Command::Up => KeyCode::Up,
+                            Command::Down => KeyCode::Down,
+                            Command::Left => KeyCode::Left,
+                            _ => KeyCode::Right,
+                        };
+                        self.replay
+                            .as_mut()
+                            .unwrap()
+                            .key(KeyEvent::new(code, KeyModifiers::NONE), &self.session);
+                        self.sync_replay(previous, store);
+                    }
+                    Some(Command::Confirm | Command::Back) => self.open_menu(Menu::Actions),
+                    _ => {}
+                },
             }
             return None;
         }
@@ -569,16 +582,17 @@ impl Postgame {
             Block::default().style(Style::default().bg(Color::Black)),
             frame.area(),
         );
-        self.layout_ready = frame.area().width >= 60 && frame.area().height >= 20;
-        let error = self.error.as_ref().or(self.audio.error.as_ref());
+        let minimum_height = if self.replay.is_some() { 24 } else { 20 };
+        self.layout_ready = frame.area().width >= 60 && frame.area().height >= minimum_height;
+        let error = self.error.as_ref();
         if !self.layout_ready {
             frame.render_widget(
                 Paragraph::new(format!(
-                    "{}\n{}\nResize to at least 60 × 20. Confirmations disabled.\n{}: back; ending a meeting requires a visible confirmation.",
-                    self.audio.status(), error.map(String::as_str).unwrap_or_default(), self.keys.hint(Command::Back)
+                    "{}\nResize to at least 60 × {minimum_height}. Confirmations disabled.\n{}: back; ending a meeting requires a visible confirmation.",
+                    error.map(String::as_str).unwrap_or_default(), self.keys.hint(Command::Back)
                 ))
                     .wrap(Wrap { trim: false })
-                    .style(Style::default().fg(if self.audio.recording() || error.is_some() { ERROR } else { FOCUS })),
+                    .style(Style::default().fg(if error.is_some() { ERROR } else { FOCUS })),
                 frame.area(),
             );
             return;
@@ -589,14 +603,14 @@ impl Postgame {
         } else {
             Padding::ZERO
         };
-        let transcript_only = self.transcript.is_some()
-            && !self.help
+        let plain_replay = self.replay.is_some()
+            && self.edit.is_none()
+            && self.jump.is_none()
             && self.menu.is_none()
-            && self.exit_links.is_none()
-            && !self.audio.starting_recording();
-        let footer_height = u16::from(!transcript_only);
+            && !self.help;
+        let footer_height = u16::from(!plain_replay);
         let rows = Layout::vertical([
-            Constraint::Length(3),
+            Constraint::Length(if self.replay.is_some() { 1 } else { 2 }),
             Constraint::Min(8),
             Constraint::Length(footer_height),
         ])
@@ -611,64 +625,45 @@ impl Postgame {
                     .is_some_and(|note| note.actionable)
             })
             .count();
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::styled(
-                    format!(
-                        "POSTGAME — {} vs {} — {}",
-                        self.session.metadata.home,
-                        self.session.metadata.away,
-                        self.session.metadata.label,
-                    ),
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-                Line::styled(
-                    self.audio.status(),
-                    Style::default()
-                        .fg(if self.audio.recording() {
-                            ERROR
-                        } else {
-                            SUCCESS
-                        })
-                        .add_modifier(Modifier::BOLD),
-                ),
-                if let Some(error) = error {
-                    Line::styled(error.as_str(), Style::default().fg(ERROR))
-                } else {
+        if self.replay.is_some() {
+            frame.render_widget(
+                Paragraph::new(error.map(String::as_str).unwrap_or("REPLAY"))
+                    .style(Style::default().fg(if error.is_some() { ERROR } else { SUCCESS })),
+                rows[0],
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(vec![
                     Line::styled(
                         format!(
-                            "Note {}/{} · {marked} actions",
-                            if self.entries.is_empty() {
-                                0
-                            } else {
-                                self.selected + 1
-                            },
-                            self.entries.len(),
+                            "POSTGAME — {} vs {} — {}",
+                            self.session.metadata.home,
+                            self.session.metadata.away,
+                            self.session.metadata.label,
                         ),
-                        Style::default().fg(MUTED),
-                    )
-                },
-            ]),
-            rows[0],
-        );
-        if self.audio.starting_recording() {
-            let inner = solid_panel(
-                frame,
-                rows[1],
-                Block::bordered()
-                    .padding(padding)
-                    .title("Microphone startup"),
-                ERROR,
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    ),
+                    if let Some(error) = error {
+                        Line::styled(error.as_str(), Style::default().fg(ERROR))
+                    } else {
+                        Line::styled(
+                            format!(
+                                "Note {}/{} · {marked} actions",
+                                if self.entries.is_empty() {
+                                    0
+                                } else {
+                                    self.selected + 1
+                                },
+                                self.entries.len(),
+                            ),
+                            Style::default().fg(MUTED),
+                        )
+                    },
+                ]),
+                rows[0],
             );
-            frame.render_widget(
-                Paragraph::new("Starting microphone…")
-                    .style(Style::default().fg(FOCUS))
-                    .wrap(Wrap { trim: false }),
-                inner,
-            );
-        } else if let Some(transcript) = &mut self.transcript {
-            transcript.draw(frame, rows[1], &self.keys);
-        } else if let Some(jump) = &self.jump {
+        }
+        if let Some(jump) = &self.jump {
             let areas =
                 Layout::vertical([Constraint::Length(3), Constraint::Min(3)]).split(rows[1]);
             let query_area = solid_panel(
@@ -774,6 +769,8 @@ impl Postgame {
                     inner,
                 );
             }
+        } else if let Some(replay) = &mut self.replay {
+            replay.draw(frame, rows[1], &self.session, Instant::now());
         } else {
             let columns =
                 Layout::horizontal([Constraint::Percentage(65), Constraint::Percentage(35)])
@@ -794,11 +791,10 @@ impl Postgame {
                 ),
                 ("Next", Some(self.selected + 1), "End of agenda", focus[2]),
             ] {
-                let entry = position
-                    .and_then(|position| self.entries.get(position))
-                    .map(|&index| &self.session.entries[index]);
-                let title = entry
-                    .map(|entry| format!("{title} · {}", presentation_time(entry)))
+                let index = position.and_then(|position| self.entries.get(position));
+                let entry = index.map(|&index| &self.session.entries[index]);
+                let title = index
+                    .map(|&index| format!("{title} · {}", presentation_time(&self.session, index)))
                     .unwrap_or_else(|| title.to_owned());
                 let preview = entry
                     .map(|entry| {
@@ -847,7 +843,10 @@ impl Postgame {
                     ),
                 ]))
                 .title_bottom(Line::styled(
-                    self.current().map(presentation_time).unwrap_or_default(),
+                    self.entries
+                        .get(self.selected)
+                        .map(|&index| presentation_time(&self.session, index))
+                        .unwrap_or_default(),
                     Style::default()
                         .fg(Color::Black)
                         .remove_modifier(Modifier::BOLD),
@@ -913,16 +912,26 @@ impl Postgame {
             );
         }
         if self.help {
-            let text = format!(
-                "{}/{}: previous/next\n{}/{}: previous/next\n{}: actions/select\n{}: menu/back\n{}: help\nPgUp/PgDn: scroll\nDetails: Esc finishes editing.\nJump to note: text or agenda number.",
-                self.keys.hint(Command::Up),
-                self.keys.hint(Command::Down),
-                self.keys.hint(Command::Left),
-                self.keys.hint(Command::Right),
-                self.keys.hint(Command::Confirm),
-                self.keys.hint(Command::Back),
-                self.keys.hint(Command::Help),
-            );
+            let text = if self.replay.is_some() {
+                format!(
+                    "Space: play/pause · ↑↓: notes · ←→: seek\nHome/End: start/end · PgUp/PgDn: scroll note\n+/-: speed · R: auto · B: balls · H: opponents\n1–5: own robot · 6–9/0: opponent\nA: actionable · E: details · Q: finish\nEsc / {}: meeting menu\nMenus: {}/{} move · {} select\nDetails: Esc finishes editing.",
+                    self.keys.hint(Command::Back),
+                    self.keys.hint(Command::Up),
+                    self.keys.hint(Command::Down),
+                    self.keys.hint(Command::Confirm)
+                )
+            } else {
+                format!(
+                    "{}/{}: previous/next\n{}/{}: previous/next\n{}: actions/select\n{}: menu/back\n{}: help\nPgUp/PgDn: scroll\nDetails: Esc finishes editing.\nJump to note: text or agenda number.",
+                    self.keys.hint(Command::Up),
+                    self.keys.hint(Command::Down),
+                    self.keys.hint(Command::Left),
+                    self.keys.hint(Command::Right),
+                    self.keys.hint(Command::Confirm),
+                    self.keys.hint(Command::Back),
+                    self.keys.hint(Command::Help),
+                )
+            };
             let inner = solid_panel(
                 frame,
                 rows[1],
@@ -932,29 +941,21 @@ impl Postgame {
             frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
         } else if let Some(menu) = self.menu {
             let (title, text) = match menu {
-                Menu::RecordingChoice => (
-                    "Meeting start · recording choice",
-                    "Record ONLY after everyone agrees.".into(),
-                ),
                 Menu::Actions => ("Actions · current note", "".into()),
                 Menu::DiscardDetails => (
                     "Discard unsaved details?",
                     "Your details draft has changes. Discard them and return to presentation?\nCancel keeps the draft.".into(),
                 ),
-                Menu::CancelTranscription => (
-                    "Cancel transcription and return?",
-                    "Stop any pending/running transcription and stay in Postgame?\nAudio and timings are retained for retry. Recording will not restart.".into(),
-                ),
                 Menu::FinishWithTabs => (
                     "Finish meeting?",
-                    format!("Open {marked} prefilled GitHub tabs in Safari?\nRecording stops and transcribes locally first.\nNothing is submitted."),
+                    format!("Open {marked} prefilled GitHub tabs in Safari?\nNothing is submitted."),
                 ),
                 Menu::FinishWithoutTabs => (
                     "Finish meeting?",
-                    "Save and finish without opening browser tabs?\nRecording stops and transcribes locally first.\nYour notes and audio remain saved.".into(),
+                    "Save and finish without opening browser tabs?".into(),
                 ),
             };
-            let destructive = matches!(menu, Menu::DiscardDetails | Menu::CancelTranscription);
+            let destructive = matches!(menu, Menu::DiscardDetails);
             let items = self.menu_items(menu);
             let width = rows[1].width.saturating_sub(4).min(64);
             let description = Paragraph::new(text).wrap(Wrap { trim: false });
@@ -1008,16 +1009,10 @@ impl Postgame {
             self.keys.hint(Command::Up),
             self.keys.hint(Command::Down)
         );
-        let footer = if self.exit_links.is_some() && self.menu != Some(Menu::CancelTranscription) {
-            format!("Finishing recording/transcription…\n{back}: cancel")
-        } else if self.help {
+        let footer = if self.help {
             format!("HELP · {back} / {help}: return")
         } else if self.menu.is_some() {
             format!("MENU · {navigation}: move · {confirm}: select\n{back}: back · {help}: help")
-        } else if self.audio.starting_recording() {
-            format!("{back}: end meeting · {help}: help")
-        } else if self.transcript.is_some() {
-            String::new()
         } else if self.jump.is_some() {
             "Text or agenda number · ↑↓: select · Enter: jump · Esc: back".into()
         } else if let Some(edit) = &self.edit {
@@ -1035,28 +1030,14 @@ impl Postgame {
         };
         let footer = if let Some(error) = error {
             format!("{error}\n{footer}")
-        } else if let Some(notice) = &self.audio.notice {
-            format!("{notice}\n{footer}")
         } else {
             footer
         };
-        if !transcript_only || error.is_some() {
-            let area = if transcript_only {
-                Rect::new(
-                    rows[1].x,
-                    rows[1].bottom().saturating_sub(1),
-                    rows[1].width,
-                    1,
-                )
-            } else {
-                rows[2]
-            };
-            frame.render_widget(
-                Paragraph::new(footer.replace('\n', " · "))
-                    .style(Style::default().fg(if error.is_some() { ERROR } else { ACCENT })),
-                area,
-            );
-        }
+        frame.render_widget(
+            Paragraph::new(footer.replace('\n', " · "))
+                .style(Style::default().fg(if error.is_some() { ERROR } else { ACCENT })),
+            rows[2],
+        );
     }
 }
 
@@ -1066,13 +1047,43 @@ pub fn run_with_settings(
     session: Session,
     settings: &Settings,
 ) -> io::Result<Vec<String>> {
-    let mut app = Postgame::new_with_settings(session, settings);
+    run_meeting(
+        terminal,
+        store,
+        Postgame::new_with_settings(session, settings),
+    )
+}
+
+pub fn run_replay_with_settings(
+    terminal: &mut Terminal<impl Backend>,
+    store: &Store,
+    session: Session,
+    settings: &Settings,
+) -> io::Result<Vec<String>> {
+    run_meeting(
+        terminal,
+        store,
+        Postgame::new_replay_with_settings(session, settings, store)?,
+    )
+}
+
+fn run_meeting(
+    terminal: &mut Terminal<impl Backend>,
+    store: &Store,
+    mut app: Postgame,
+) -> io::Result<Vec<String>> {
+    let mut last = Instant::now();
     loop {
-        if let Some(links) = app.poll_audio(store) {
-            return Ok(links);
-        }
+        let now = Instant::now();
+        app.tick_replay(now.duration_since(last), store);
+        last = now;
         terminal.draw(|frame| app.draw(frame))?;
-        if !event::poll(Duration::from_millis(100))? {
+        let delay = if app.replay.as_ref().is_some_and(|replay| !replay.paused) {
+            10
+        } else {
+            100
+        };
+        if !event::poll(Duration::from_millis(delay))? {
             continue;
         }
         match event::read()? {
@@ -1080,6 +1091,8 @@ pub fn run_with_settings(
                 if let Some(links) = app.key(key, store) {
                     return Ok(links);
                 }
+                let current = app.current_index();
+                app.sync_replay(current, store);
             }
             Event::Paste(text) => app.paste(&text),
             _ => {}
@@ -1087,15 +1100,83 @@ pub fn run_with_settings(
     }
 }
 
-fn presentation_time(entry: &Entry) -> String {
-    format!(
+fn presentation_time(session: &Session, index: usize) -> String {
+    let entry = &session.entries[index];
+    let mut time = format!(
         "Wall {} · GC {}",
         entry.timestamp.format("%H:%M:%S"),
         entry
             .gc_seconds_remaining
             .map(format_clock)
             .unwrap_or_else(|| "—".into()),
-    )
+    );
+    if let Some(phase) = presentation_phase(session, index) {
+        write!(time, " · {phase}").unwrap();
+    }
+    time
+}
+
+fn presentation_phase(session: &Session, index: usize) -> Option<&'static str> {
+    let mut game = session.match_type.unwrap_or(MatchType::Official);
+    let mut phase = None;
+    for entry in session.entries[..=index]
+        .iter()
+        .filter(|entry| !entry.undone)
+    {
+        let entry_game = entry.game.unwrap_or_else(|| {
+            if session.match_type.is_none() && entry.kind == EventKind::GoldenGoalStart {
+                MatchType::GoldenGoal
+            } else if session.match_type.is_none() && entry.ends_golden_goal() {
+                MatchType::Official
+            } else {
+                game
+            }
+        });
+        if entry_game != game {
+            phase = None;
+            game = entry_game;
+        }
+        if game != MatchType::Official {
+            continue;
+        }
+        phase = if entry.from_controller && entry.kind != EventKind::Note {
+            controller_phase(&entry.text)
+        } else {
+            match entry.kind {
+                EventKind::GameStart => Some("first half"),
+                EventKind::HalfTime => Some("half-time"),
+                EventKind::SecondHalfStart => Some("second half"),
+                EventKind::GameEnd => None,
+                _ => phase,
+            }
+        };
+    }
+    phase
+}
+
+fn controller_phase(text: &str) -> Option<&'static str> {
+    let text = text
+        .strip_prefix("GC received: ")
+        .or_else(|| text.strip_prefix("GC sync — received: "))?;
+    let summary = text.split_once("; set play: ")?.0.rsplit_once("; ")?.1;
+    let (phase, rest) = summary.split_once(" / ")?;
+    let (state, half) = rest.split_once(" / ")?;
+    if !matches!(state, "Initial" | "Ready" | "Set" | "Playing" | "Finished")
+        || !matches!(half, "first half" | "second half")
+    {
+        return None;
+    }
+    match (phase, state, half) {
+        ("Normal", "Finished", "first half") => Some("half-time"),
+        ("Normal", "Finished", "second half") => Some("full-time"),
+        ("Normal", _, "first half") => Some("first half"),
+        ("Normal", _, "second half") => Some("second half"),
+        ("Extra time", _, "first half") => Some("extra time · first half"),
+        ("Extra time", _, "second half") => Some("extra time · second half"),
+        ("Penalty shootout", _, _) => Some("penalty shootout"),
+        ("Timeout", _, _) => Some("timeout"),
+        _ => None,
+    }
 }
 
 fn clock(entry: &Entry) -> String {
@@ -1203,7 +1284,3 @@ pub fn open_tabs(links: &[String]) -> io::Result<()> {
     }
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "../tests/unit/postgame.rs"]
-mod tests;

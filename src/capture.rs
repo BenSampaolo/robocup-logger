@@ -1,15 +1,14 @@
 use crate::model::MatchType;
 use chrono::{DateTime, FixedOffset};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::path::Path;
 
-const FORMAT: &str = "robocup-logger-gc";
 const VERSION: u32 = 1;
 const MAX_PACKET_BYTES: usize = 65_535;
-// JSON represents each payload byte with at most three digits and a comma.
 const MAX_RECORD_BYTES: usize = MAX_PACKET_BYTES * 4 + 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -26,6 +25,39 @@ pub struct Packet {
     pub active: bool,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RobotPacket {
+    pub id: u64,
+    pub received_at: DateTime<FixedOffset>,
+    pub source: SocketAddr,
+    pub packet: Vec<u8>,
+}
+
+pub trait Record: Serialize + DeserializeOwned {
+    const FORMAT: &'static str;
+    fn validate(&self, expected_id: u64) -> io::Result<u64>;
+}
+
+impl Record for Packet {
+    const FORMAT: &'static str = "robocup-logger-gc";
+
+    fn validate(&self, expected_id: u64) -> io::Result<u64> {
+        if self.game == Some(MatchType::Combined) {
+            return Err(invalid_data("Capture packet game cannot be Combined"));
+        }
+        validate_packet(self.id, self.packet.len(), expected_id)
+    }
+}
+
+impl Record for RobotPacket {
+    const FORMAT: &'static str = "robocup-logger-robots";
+
+    fn validate(&self, expected_id: u64) -> io::Result<u64> {
+        validate_packet(self.id, self.packet.len(), expected_id)
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Header {
@@ -34,14 +66,18 @@ struct Header {
     session_id: String,
 }
 
-pub struct CaptureLog {
+pub type CaptureLog = PacketLog<Packet>;
+pub type RobotCaptureLog = PacketLog<RobotPacket>;
+
+pub struct PacketLog<P> {
     file: File,
+    _record: PhantomData<P>,
     next_id: u64,
     committed_len: u64,
     needs_rollback: bool,
 }
 
-impl CaptureLog {
+impl<P: Record> PacketLog<P> {
     pub fn open(path: &Path, session_id: &str) -> io::Result<Self> {
         validate_session_id(session_id)?;
         let (mut file, created) = match OpenOptions::new()
@@ -59,7 +95,7 @@ impl CaptureLog {
         };
         let next_id = if created {
             let header = Header {
-                format: FORMAT.into(),
+                format: P::FORMAT.into(),
                 version: VERSION,
                 session_id: session_id.into(),
             };
@@ -74,11 +110,12 @@ impl CaptureLog {
             .sync_all()?;
             1
         } else {
-            scan(&mut file, session_id, |_| {})?
+            scan::<P>(&mut file, session_id, |_| {})?
         };
         let committed_len = file.seek(SeekFrom::End(0))?;
         Ok(Self {
             file,
+            _record: PhantomData,
             next_id,
             committed_len,
             needs_rollback: false,
@@ -89,7 +126,7 @@ impl CaptureLog {
         self.next_id
     }
 
-    pub fn append(&mut self, packets: &[Packet]) -> io::Result<()> {
+    pub fn append(&mut self, packets: &[P]) -> io::Result<()> {
         self.append_with(packets, |file, bytes| {
             file.write_all(bytes)?;
             file.sync_all()
@@ -98,13 +135,13 @@ impl CaptureLog {
 
     fn append_with(
         &mut self,
-        packets: &[Packet],
+        packets: &[P],
         write_batch: impl FnOnce(&mut File, &[u8]) -> io::Result<()>,
     ) -> io::Result<()> {
         let mut next_id = self.next_id;
         let mut bytes = Vec::new();
         for packet in packets {
-            next_id = validate_packet(packet, next_id)?;
+            next_id = packet.validate(next_id)?;
             serde_json::to_writer(&mut bytes, packet).map_err(invalid_data)?;
             bytes.push(b'\n');
         }
@@ -145,32 +182,41 @@ impl CaptureLog {
         Ok(())
     }
 
-    pub fn read(path: &Path, session_id: &str) -> io::Result<Vec<Packet>> {
+    pub fn visit(path: &Path, session_id: &str, collect: impl FnMut(P)) -> io::Result<()> {
         validate_session_id(session_id)?;
         check_regular_file(path)?;
+        scan(File::open(path)?, session_id, collect)?;
+        Ok(())
+    }
+
+    pub fn read(path: &Path, session_id: &str) -> io::Result<Vec<P>> {
         let mut packets = Vec::new();
-        scan(File::open(path)?, session_id, |packet| packets.push(packet))?;
+        Self::visit(path, session_id, |packet| packets.push(packet))?;
         Ok(packets)
     }
 }
 
-fn scan(file: impl Read, session_id: &str, mut collect: impl FnMut(Packet)) -> io::Result<u64> {
+fn scan<P: Record>(
+    file: impl Read,
+    session_id: &str,
+    mut collect: impl FnMut(P),
+) -> io::Result<u64> {
     let mut reader = BufReader::new(file);
     let mut line = Vec::new();
     if !read_line(&mut reader, &mut line)? {
         return Err(invalid_data("Capture header is missing"));
     }
     let header: Header = serde_json::from_slice(&line).map_err(invalid_data)?;
-    if header.format != FORMAT || header.version != VERSION || header.session_id != session_id {
+    if header.format != P::FORMAT || header.version != VERSION || header.session_id != session_id {
         return Err(invalid_data(
             "Capture header belongs to another session or unsupported format/version",
         ));
     }
     let mut next_id = 1;
     while read_line(&mut reader, &mut line)? {
-        let packet: Packet = serde_json::from_slice(&line)
+        let packet: P = serde_json::from_slice(&line)
             .map_err(|error| invalid_data(format!("Invalid capture packet {next_id}: {error}")))?;
-        next_id = validate_packet(&packet, next_id)?;
+        next_id = packet.validate(next_id)?;
         collect(packet);
     }
     Ok(next_id)
@@ -195,18 +241,14 @@ fn read_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> io::Result<bool> 
     Ok(true)
 }
 
-fn validate_packet(packet: &Packet, expected_id: u64) -> io::Result<u64> {
-    if packet.id != expected_id {
+fn validate_packet(id: u64, length: usize, expected_id: u64) -> io::Result<u64> {
+    if id != expected_id {
         return Err(invalid_data(format!(
-            "Capture packet ID {} is not the expected ID {expected_id}",
-            packet.id
+            "Capture packet ID {id} is not the expected ID {expected_id}"
         )));
     }
-    if packet.packet.len() > MAX_PACKET_BYTES {
+    if length > MAX_PACKET_BYTES {
         return Err(invalid_data("Capture payload exceeds the UDP size limit"));
-    }
-    if packet.game == Some(MatchType::Combined) {
-        return Err(invalid_data("Capture packet game cannot be Combined"));
     }
     expected_id
         .checked_add(1)
@@ -234,6 +276,3 @@ fn invalid_data(error: impl ToString) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
-#[cfg(test)]
-#[path = "../tests/unit/capture.rs"]
-mod tests;

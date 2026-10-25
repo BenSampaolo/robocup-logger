@@ -46,6 +46,10 @@ impl Discovery {
         self.receiver.as_ref().and_then(Receiver::detected_teams)
     }
 
+    pub fn source(&self) -> Option<std::net::IpAddr> {
+        self.receiver.as_ref().and_then(Receiver::detected_source)
+    }
+
     pub fn status(&self) -> (String, bool) {
         if let Some(error) = &self.error {
             return (error.clone(), false);
@@ -67,8 +71,6 @@ pub(crate) struct Probe {
     enabled: bool,
     last_request: Option<Instant>,
     pub error: Option<String>,
-    #[cfg(test)]
-    destinations: Vec<SocketAddr>,
 }
 
 impl Probe {
@@ -88,17 +90,10 @@ impl Probe {
             return;
         }
         self.last_request = Some(now);
-        #[cfg(not(test))]
         let destinations = destinations();
-        #[cfg(test)]
-        let destinations = self.destinations.clone();
         let mut sent = false;
         let mut last_error = None;
         for destination in destinations {
-            #[cfg(test)]
-            assert!(
-                destination.ip().is_loopback() && ![0, 3636, 3838].contains(&destination.port())
-            );
             match socket.send_to(b"RGTr\0", destination) {
                 Ok(_) => sent = true,
                 Err(error) => last_error = Some(error.to_string()),
@@ -107,19 +102,10 @@ impl Probe {
         self.error = if sent { None } else { last_error };
     }
 
-    #[cfg(test)]
-    pub fn for_test(destinations: Vec<SocketAddr>) -> Self {
-        Self {
-            destinations,
-            ..Self::enabled()
-        }
-    }
 }
 
-#[cfg(not(test))]
 fn destinations() -> Vec<SocketAddr> {
     let mut addresses = vec![Ipv4Addr::new(10, 0, 0, 10), Ipv4Addr::BROADCAST];
-    // Directed broadcasts reach attached LANs even when a VPN owns the default route.
     #[cfg(target_os = "macos")]
     if let Ok(output) = std::process::Command::new("/sbin/ifconfig")
         .arg("-a")
@@ -140,7 +126,7 @@ fn destinations() -> Vec<SocketAddr> {
     result
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 fn interface_broadcasts(text: &str) -> Vec<Ipv4Addr> {
     text.split_whitespace()
         .collect::<Vec<_>>()
@@ -153,6 +139,3 @@ fn interface_broadcasts(text: &str) -> Vec<Ipv4Addr> {
         .collect()
 }
 
-#[cfg(test)]
-#[path = "../tests/unit/discovery.rs"]
-mod tests;

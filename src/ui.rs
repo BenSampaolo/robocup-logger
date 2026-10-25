@@ -18,6 +18,10 @@ use crate::{
 };
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    let now = std::time::Instant::now();
+    if let Some(session) = &app.session {
+        app.arcade.observe(session, now);
+    }
     let area = frame.area();
     app.controls_visible = area.width >= 60 && area.height >= 16;
     frame.render_widget(
@@ -34,8 +38,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Constraint::Length(1),
     ])
     .split(area);
-    let columns =
-        Layout::horizontal([Constraint::Ratio(2, 3), Constraint::Ratio(1, 3)]).split(rows[1]);
+    let columns = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(rows[1]);
     let (label, color) = app.mode_style();
     frame.render_widget(
         Paragraph::new(format!(" ● {label} ")).style(
@@ -65,10 +68,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             ..rows[0]
         },
     );
-    draw_preview(frame, app, columns[1]);
+    draw_preview(frame, app, columns[2]);
     match &mut app.mode {
-        Mode::Form(form) => draw_form(frame, form, columns[0]),
-        _ => draw_log(frame, app, columns[0]),
+        Mode::Form(form) => draw_form(frame, form, columns[0].union(columns[1])),
+        _ => {
+            draw_log(frame, app, columns[0]);
+            let middle =
+                Layout::vertical([Constraint::Length(4), Constraint::Min(0)]).split(columns[1]);
+            let gc_clock = app
+                .controller
+                .as_ref()
+                .and_then(|receiver| receiver.live_clock(now));
+            app.arcade.draw(frame, middle[0], now, gc_clock);
+            crate::field::draw(frame, middle[1], &app.field_dimensions, &app.telemetry);
+        }
     }
     match &mut app.mode {
         Mode::Actions {
@@ -419,7 +432,6 @@ fn panel(title: impl Into<Line<'static>>, color: Color, vertical_padding: u16) -
 }
 
 fn opponent_warning(session: &Session, packet: &Snapshot) -> Option<(String, Color)> {
-    // The receiver can already show the new opponent while Actions defers its import.
     let pending_official = session.match_type == Some(MatchType::Combined)
         && session.in_golden_goal()
         && session.is_finished()
@@ -529,7 +541,9 @@ fn controller_status(app: &App) -> Line<'static> {
             };
             format!(
                 " {} • {home_team} {home}:{away} {away_team} • {}",
-                packet.clock(),
+                controller
+                    .live_clock(std::time::Instant::now())
+                    .unwrap_or_else(|| packet.clock()),
                 packet.summary()
             )
         }
